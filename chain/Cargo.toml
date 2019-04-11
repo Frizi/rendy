@@ -14,7 +14,7 @@ description = "Rendy's node synchronization tool"
 profiler = [ "thread_profiler/thread_profiler" ]
 
 [dependencies]
-gfx-hal = "0.1"
+gfx-hal = { git = "https://github.com/gfx-rs/gfx.git" }
 fnv = "1.0"
 log = "0.4"
 thread_profiler = "0.3"
