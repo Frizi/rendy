@@ -1,20 +1,18 @@
 use {
     crate::{
         command::{
-            CommandBuffer, CommandPool, ExecutableState, Families, Family, FamilyId, Fence,
-            Graphics, IndividualReset, MultiShot, NoSimultaneousUse, PendingState, Queue, QueueId,
-            SecondaryLevel, SimultaneousUse, Submission, Submit,
+            CommandBuffer, CommandPool, ExecutableState, Families, Family, FamilyId, Graphics,
+            IndividualReset, MultiShot, NoSimultaneousUse, PendingState, QueueId, SecondaryLevel,
+            SimultaneousUse, Submission, Submit,
         },
         factory::Factory,
-        frame::{
-            cirque::{CirqueRef, CommandCirque},
-            Frames,
-        },
+        frame::cirque::{CirqueRef, CommandCirque},
         graph::GraphContext,
         node::{
             gfx_acquire_barriers, gfx_release_barriers, is_metal,
             render::group::{RenderGroup, RenderGroupBuilder},
-            BufferAccess, DynNode, ImageAccess, NodeBuffer, NodeBuildError, NodeBuilder, NodeImage,
+            BufferAccess, DynNode, ImageAccess, NodeBuffer, NodeBuildError, NodeBuilder,
+            NodeContext, NodeImage,
         },
         wsi::{Surface, Target},
         BufferId, ImageId, NodeId,
@@ -984,17 +982,7 @@ where
     B: Backend,
     T: ?Sized,
 {
-    unsafe fn run<'a>(
-        &mut self,
-        _ctx: &GraphContext<B>,
-        factory: &Factory<B>,
-        queue: &mut Queue<B>,
-        aux: &T,
-        frames: &Frames<B>,
-        waits: &[(&'a B::Semaphore, gfx_hal::pso::PipelineStage)],
-        signals: &[&'a B::Semaphore],
-        fence: Option<&mut Fence<B>>,
-    ) {
+    unsafe fn run<'a>(&mut self, ctx: NodeContext<'_, B, T>) {
         let RenderPassNodeWithSurface {
             common:
                 RenderPassNodeCommon {
@@ -1030,7 +1018,7 @@ where
             }
         };
 
-        let submit = command_cirque.encode(frames, command_pool, |mut cbuf| {
+        let submit = command_cirque.encode(ctx.frames, command_pool, |mut cbuf| {
             let index = cbuf.index();
 
             if let Some(next) = &next {
@@ -1045,14 +1033,14 @@ where
                             .fold(force_record, |force_record, group| {
                                 group
                                     .prepare(
-                                        factory,
-                                        queue.id(),
+                                        ctx.factory,
+                                        ctx.queue.id(),
                                         index,
                                         gfx_hal::pass::Subpass {
                                             index: subpass_index,
                                             main_pass: &render_pass,
                                         },
-                                        aux,
+                                        ctx.aux,
                                     )
                                     .force_record()
                                     || force_record
@@ -1103,7 +1091,7 @@ where
                                         index: subpass_index,
                                         main_pass: &render_pass,
                                     },
-                                    aux,
+                                    ctx.aux,
                                 )
                             })
                         });
@@ -1120,30 +1108,30 @@ where
 
         log::trace!("Submit render pass");
 
-        queue.submit(
+        ctx.queue.submit(
             Some(
                 Submission::new()
                     .submits(Some(submit))
-                    .wait(waits.iter().cloned().chain(next.as_ref().map(|n| {
+                    .wait(ctx.waits.iter().cloned().chain(next.as_ref().map(|n| {
                         (
                             &per_image[n[0] as usize].acquire,
                             gfx_hal::pso::PipelineStage::TOP_OF_PIPE,
                         )
                     })))
                     .signal(
-                        signals
+                        ctx.signals
                             .iter()
                             .cloned()
                             .chain(next.as_ref().map(|n| (&per_image[n[0] as usize].release))),
                     ),
             ),
-            fence,
+            ctx.fence,
         );
 
         if let Some(next) = next {
             log::trace!("Present");
             let ref mut for_image = per_image[next[0] as usize];
-            if let Err(err) = next.present(queue.raw(), Some(&for_image.release)) {
+            if let Err(err) = next.present(ctx.queue.raw(), Some(&for_image.release)) {
                 log::debug!("Swapchain presentation error: {:#?}", err);
             }
         }
@@ -1172,17 +1160,7 @@ where
     B: Backend,
     T: ?Sized,
 {
-    unsafe fn run<'a>(
-        &mut self,
-        _ctx: &GraphContext<B>,
-        factory: &Factory<B>,
-        queue: &mut Queue<B>,
-        aux: &T,
-        frames: &Frames<B>,
-        waits: &[(&'a B::Semaphore, gfx_hal::pso::PipelineStage)],
-        signals: &[&'a B::Semaphore],
-        fence: Option<&mut Fence<B>>,
-    ) {
+    unsafe fn run<'a>(&mut self, mut ctx: NodeContext<'_, B, T>) {
         let RenderPassNodeWithoutSurface {
             common:
                 RenderPassNodeCommon {
@@ -1204,7 +1182,7 @@ where
             framebuffer,
         } = self;
 
-        let submit = command_cirque.encode(frames, command_pool, |mut cbuf| {
+        let submit = command_cirque.encode(ctx.frames, command_pool, |mut cbuf| {
             let index = cbuf.index();
 
             let force_record = subpasses.iter_mut().enumerate().fold(
@@ -1216,14 +1194,14 @@ where
                         .fold(force_record, |force_record, group| {
                             group
                                 .prepare(
-                                    factory,
-                                    queue.id(),
+                                    ctx.factory,
+                                    ctx.queue.id(),
                                     index,
                                     gfx_hal::pass::Subpass {
                                         index: subpass_index,
                                         main_pass: &render_pass,
                                     },
-                                    aux,
+                                    ctx.aux,
                                 )
                                 .force_record()
                                 || force_record
@@ -1265,7 +1243,7 @@ where
                                     index: subpass_index,
                                     main_pass: &render_pass,
                                 },
-                                aux,
+                                ctx.aux,
                             )
                         })
                     });
@@ -1279,15 +1257,7 @@ where
             })
         });
 
-        queue.submit(
-            Some(
-                Submission::new()
-                    .submits(Some(submit))
-                    .wait(waits.iter().cloned())
-                    .signal(signals.iter().cloned()),
-            ),
-            fence,
-        );
+        ctx.submit(Some(submit));
     }
 
     unsafe fn dispose(self: Box<Self>, factory: &mut Factory<B>, aux: &T) {

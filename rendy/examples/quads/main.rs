@@ -11,10 +11,9 @@
 use rendy::{
     command::{
         CommandBuffer, CommandPool, Compute, DrawCommand, ExecutableState, Families, Family,
-        MultiShot, PendingState, QueueId, RenderPassEncoder, SimultaneousUse, Submit,
+        FamilyId, MultiShot, PendingState, QueueId, RenderPassEncoder, SimultaneousUse, Submit,
     },
     factory::{BufferState, Config, Factory},
-    frame::Frames,
     graph::{
         gfx_acquire_barriers, gfx_release_barriers,
         present::PresentNode,
@@ -22,8 +21,8 @@ use rendy::{
             Layout, PrepareResult, RenderGroupBuilder, SimpleGraphicsPipeline,
             SimpleGraphicsPipelineDesc,
         },
-        BufferAccess, Graph, GraphBuilder, GraphContext, Node, NodeBuffer, NodeBuildError,
-        NodeDesc, NodeImage, NodeSubmittable,
+        BufferAccess, BufferId, DynNode, Graph, GraphBuilder, GraphContext, NodeBuffer,
+        NodeBuildError, NodeBuilder, NodeContext, NodeImage,
     },
     hal::{self, device::Device as _},
     memory::Dynamic,
@@ -360,32 +359,16 @@ struct GravBounce<B: hal::Backend> {
     submit: Submit<B, SimultaneousUse>,
 }
 
-impl<'a, B> NodeSubmittable<'a, B> for GravBounce<B>
-where
-    B: hal::Backend,
-{
-    type Submittable = &'a Submit<B, SimultaneousUse>;
-    type Submittables = &'a [Submit<B, SimultaneousUse>];
-}
-
-impl<B, T> Node<B, T> for GravBounce<B>
+impl<B, T> DynNode<B, T> for GravBounce<B>
 where
     B: hal::Backend,
     T: ?Sized,
 {
-    type Capability = Compute;
-
-    fn run<'a>(
-        &'a mut self,
-        _ctx: &GraphContext<B>,
-        _factory: &Factory<B>,
-        _aux: &T,
-        _frames: &'a Frames<B>,
-    ) -> &'a [Submit<B, SimultaneousUse>] {
-        std::slice::from_ref(&self.submit)
+    unsafe fn run(&mut self, mut ctx: NodeContext<'_, B, T>) {
+        ctx.submit(Some(&self.submit));
     }
 
-    unsafe fn dispose(mut self, factory: &mut Factory<B>, _aux: &T) {
+    unsafe fn dispose(mut self: Box<Self>, factory: &mut Factory<B>, _aux: &T) {
         drop(self.submit);
         self.command_pool
             .free_buffers(Some(self.command_buffer.mark_complete()));
@@ -395,26 +378,39 @@ where
     }
 }
 
-#[derive(Debug, Default)]
-struct GravBounceDesc;
+#[derive(Debug)]
+struct GravBounceDesc {
+    posvel_buffer: BufferId,
+}
 
-impl<B, T> NodeDesc<B, T> for GravBounceDesc
+impl GravBounceDesc {
+    pub fn with_buffer(posvel_buffer: BufferId) -> Self {
+        Self { posvel_buffer }
+    }
+}
+
+impl<B, T> NodeBuilder<B, T> for GravBounceDesc
 where
     B: hal::Backend,
     T: ?Sized,
 {
-    type Node = GravBounce<B>;
+    fn family(&self, _factory: &mut Factory<B>, families: &Families<B>) -> Option<FamilyId> {
+        families.with_capability::<Compute>()
+    }
 
-    fn buffers(&self) -> Vec<BufferAccess> {
-        vec![BufferAccess {
-            access: hal::buffer::Access::SHADER_READ | hal::buffer::Access::SHADER_WRITE,
-            stages: hal::pso::PipelineStage::COMPUTE_SHADER,
-            usage: hal::buffer::Usage::STORAGE | hal::buffer::Usage::TRANSFER_DST,
-        }]
+    fn buffers(&self) -> Vec<(BufferId, BufferAccess)> {
+        vec![(
+            self.posvel_buffer,
+            BufferAccess {
+                access: hal::buffer::Access::SHADER_READ | hal::buffer::Access::SHADER_WRITE,
+                stages: hal::pso::PipelineStage::COMPUTE_SHADER,
+                usage: hal::buffer::Usage::STORAGE | hal::buffer::Usage::TRANSFER_DST,
+            },
+        )]
     }
 
     fn build<'a>(
-        self,
+        self: Box<Self>,
         ctx: &GraphContext<B>,
         factory: &mut Factory<B>,
         family: &mut Family<B>,
@@ -422,7 +418,7 @@ where
         _aux: &T,
         buffers: Vec<NodeBuffer>,
         images: Vec<NodeImage>,
-    ) -> Result<Self::Node, NodeBuildError> {
+    ) -> Result<Box<dyn DynNode<B, T>>, NodeBuildError> {
         assert!(images.is_empty());
         assert_eq!(buffers.len(), 1);
 
@@ -547,26 +543,27 @@ where
 
         let (submit, command_buffer) = recording.finish().submit();
 
-        Ok(GravBounce {
+        Ok(Box::new(GravBounce {
             set_layout,
             pipeline_layout,
             pipeline,
             descriptor_set,
-            // buffer_view,
             command_pool,
             command_buffer,
             submit,
-        })
+        }))
     }
 }
 
 #[cfg(any(feature = "dx12", feature = "metal", feature = "vulkan"))]
 fn run(
     event_loop: EventLoop<()>,
-    mut factory: Factory<Backend>,
-    mut families: Families<Backend>,
+    factory: Factory<Backend>,
+    families: Families<Backend>,
     window: Window,
 ) {
+    let mut factory = std::mem::ManuallyDrop::new(factory);
+    let mut families = std::mem::ManuallyDrop::new(families);
     let mut graph = Some(build_graph(&mut factory, &mut families, &window));
 
     let started = std::time::Instant::now();
@@ -599,20 +596,26 @@ fn run(
                     *control_flow = ControlFlow::Exit
                 }
             }
+            Event::LoopDestroyed => {
+                let elapsed_ns = elapsed.as_secs() * 1_000_000_000 + elapsed.subsec_nanos() as u64;
+                log::info!(
+                    "Elapsed: {:?}. Frames: {}. FPS: {}",
+                    elapsed,
+                    frame,
+                    frame * 1_000_000_000 / elapsed_ns
+                );
+
+                if graph.is_some() {
+                    graph.take().unwrap().dispose(&mut factory, &());
+                }
+
+                unsafe {
+                    std::mem::ManuallyDrop::drop(&mut families);
+                    std::mem::ManuallyDrop::drop(&mut factory);
+                }
+                println!("Factory dropped");
+            }
             _ => {}
-        }
-
-        if *control_flow == ControlFlow::Exit && graph.is_some() {
-            let elapsed_ns = elapsed.as_secs() * 1_000_000_000 + elapsed.subsec_nanos() as u64;
-
-            log::info!(
-                "Elapsed: {:?}. Frames: {}. FPS: {}",
-                elapsed,
-                frame,
-                frame * 1_000_000_000 / elapsed_ns
-            );
-
-            graph.take().unwrap().dispose(&mut factory, &());
         }
     });
 }
@@ -675,19 +678,18 @@ fn build_graph(
         }),
     );
 
-    let grav = graph_builder.add_node(GravBounceDesc.builder().with_buffer(posvel));
+    graph_builder.add_node(GravBounceDesc::with_buffer(posvel));
 
-    let pass = graph_builder.add_node(
+    graph_builder.add_node(
         QuadsRenderPipeline::builder()
             .with_buffer(posvel)
-            .with_dependency(grav)
             .into_subpass()
             .with_color(color)
             .with_depth_stencil(depth)
             .into_pass(),
     );
 
-    graph_builder.add_node(PresentNode::builder(&factory, surface, color).with_dependency(pass));
+    graph_builder.add_node(PresentNode::builder(&factory, surface, color));
 
     let started = std::time::Instant::now();
     let graph = graph_builder.build(factory, families, &()).unwrap();

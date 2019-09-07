@@ -407,14 +407,14 @@ fn main() {
         }),
     );
 
-    let pass = graph_builder.add_node(
+    graph_builder.add_node(
         SpriteGraphicsPipeline::builder()
             .into_subpass()
             .with_color(color)
             .into_pass(),
     );
 
-    graph_builder.add_node(PresentNode::builder(&factory, surface, color).with_dependency(pass));
+    graph_builder.add_node(PresentNode::builder(&factory, surface, color));
 
     let graph = graph_builder
         .build(&mut factory, &mut families, &())

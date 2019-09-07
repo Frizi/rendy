@@ -6,7 +6,7 @@ pub mod render;
 
 use {
     crate::{
-        command::{Capability, Families, Family, FamilyId, Fence, Queue, Submission, Submittable},
+        command::{Families, Family, FamilyId, Fence, Queue, Submission, Submittable},
         factory::{Factory, UploadError},
         frame::Frames,
         graph::GraphContext,
@@ -130,108 +130,11 @@ pub struct NodeImage {
     pub release: Option<ImageBarrier>,
 }
 
-/// NodeSubmittable
-pub trait NodeSubmittable<'a, B: Backend> {
-    /// Submittable type returned from `Node`.
-    type Submittable: Submittable<B> + 'a;
-
-    /// Iterator over submittables returned from `Node`.
-    type Submittables: IntoIterator<Item = Self::Submittable>;
-}
-
-/// The node is building block of the framegraph.
-/// Node defines set of resources and operations to perform over them.
-/// Read-only data for operations comes from auxiliary data source `T`.
-///
-/// # Parameters
-///
-/// `B` - backend type.
-/// `T` - auxiliary data type.
-///
-pub trait Node<B: Backend, T: ?Sized>:
-    for<'a> NodeSubmittable<'a, B> + std::fmt::Debug + Sized + Sync + Send + 'static
-{
-    /// Capability required by node.
-    /// Graph will execute this node on command queue that supports this capability level.
-    type Capability: Capability;
-
-    /// Record commands required by node.
-    /// Returned submits are guaranteed to be submitted within specified frame.
-    fn run<'a>(
-        &'a mut self,
-        ctx: &GraphContext<B>,
-        factory: &Factory<B>,
-        aux: &T,
-        frames: &'a Frames<B>,
-    ) -> <Self as NodeSubmittable<'a, B>>::Submittables;
-
-    /// Dispose of the node.
-    ///
-    /// # Safety
-    ///
-    /// Must be called after waiting for device idle.
-    unsafe fn dispose(self, factory: &mut Factory<B>, aux: &T);
-}
-
-/// Description of the node.
-/// Implementation of the builder type provide framegraph with static information about node
-/// that is used for building the node.
-pub trait NodeDesc<B: Backend, T: ?Sized>: std::fmt::Debug + Sized + 'static {
-    /// Node this builder builds.
-    type Node: Node<B, T>;
-
-    /// Make node builder.
-    fn builder(self) -> DescBuilder<B, T, Self> {
-        DescBuilder::new(self)
-    }
-
-    /// Get set or buffer resources the node uses.
-    fn buffers(&self) -> Vec<BufferAccess> {
-        Vec::new()
-    }
-
-    /// Get set or image resources the node uses.
-    fn images(&self) -> Vec<ImageAccess> {
-        Vec::new()
-    }
-
-    /// Build the node.
-    ///
-    /// # Parameters
-    ///
-    /// `factory`    - factory instance.
-    /// `aux`       - auxiliary data.
-    /// `family`    - id of the family this node will be executed on.
-    /// `resources` - set of transient resources managed by graph.
-    ///               with barriers required for interface resources.
-    ///
-    fn build<'a>(
-        self,
-        ctx: &GraphContext<B>,
-        factory: &mut Factory<B>,
-        family: &mut Family<B>,
-        queue: usize,
-        aux: &T,
-        buffers: Vec<NodeBuffer>,
-        images: Vec<NodeImage>,
-    ) -> Result<Self::Node, NodeBuildError>;
-}
-
 /// Trait-object safe `Node`.
-pub trait DynNode<B: Backend, T: ?Sized>: std::fmt::Debug + Sync + Send {
+pub trait DynNode<B: Backend, T: ?Sized>: std::fmt::Debug + Send + Sync {
     /// Record commands required by node.
     /// Recorded buffers go into `submits`.
-    unsafe fn run<'a>(
-        &mut self,
-        ctx: &GraphContext<B>,
-        factory: &Factory<B>,
-        queue: &mut Queue<B>,
-        aux: &T,
-        frames: &Frames<B>,
-        waits: &[(&'a B::Semaphore, gfx_hal::pso::PipelineStage)],
-        signals: &[&'a B::Semaphore],
-        fence: Option<&mut Fence<B>>,
-    );
+    unsafe fn run(&mut self, ctx: NodeContext<'_, B, T>);
 
     /// Dispose of the node.
     ///
@@ -241,37 +144,44 @@ pub trait DynNode<B: Backend, T: ?Sized>: std::fmt::Debug + Sync + Send {
     unsafe fn dispose(self: Box<Self>, factory: &mut Factory<B>, aux: &T);
 }
 
-impl<B, T, N> DynNode<B, T> for (N,)
-where
-    B: Backend,
-    T: ?Sized,
-    N: Node<B, T>,
-{
-    unsafe fn run<'a>(
-        &mut self,
-        ctx: &GraphContext<B>,
-        factory: &Factory<B>,
-        queue: &mut Queue<B>,
-        aux: &T,
-        frames: &Frames<B>,
-        waits: &[(&'a B::Semaphore, gfx_hal::pso::PipelineStage)],
-        signals: &[&'a B::Semaphore],
-        fence: Option<&mut Fence<B>>,
-    ) {
-        let submittables = Node::run(&mut self.0, ctx, factory, aux, frames);
-        queue.submit(
+/// A context for rendergraph node execution. Contains all data that the node
+/// get access to and contains ready-made methods for common operations.
+#[derive(Debug)]
+pub struct NodeContext<'a, B: Backend, T: ?Sized> {
+    /// graph context
+    pub graph_ctx: &'a GraphContext<B>,
+    /// rendy Factory used by this graph
+    pub factory: &'a Factory<B>,
+    /// current rendering queue
+    pub queue: &'a mut Queue<B>,
+    /// user data provided to RenderGraph::run
+    pub aux: &'a T,
+    /// timeline of frames
+    pub frames: &'a Frames<B>,
+    /// semaphores to wait for on submission
+    pub waits: smallvec::SmallVec<[(&'a B::Semaphore, gfx_hal::pso::PipelineStage); 16]>,
+    /// semaphores to signal on submission
+    pub signals: smallvec::SmallVec<[&'a B::Semaphore; 16]>,
+    /// submitted fence
+    pub fence: Option<&'a mut Fence<B>>,
+}
+
+impl<'a, B: Backend, T: ?Sized> NodeContext<'a, B, T> {
+    /// Safety: Fence must be submitted
+    pub unsafe fn submit<C>(&mut self, submits: C)
+    where
+        C: IntoIterator,
+        C::Item: Submittable<B>,
+    {
+        self.queue.submit(
             Some(
                 Submission::new()
-                    .submits(submittables)
-                    .wait(waits.iter().cloned())
-                    .signal(signals.iter().cloned()),
+                    .submits(submits)
+                    .wait(self.waits.iter().cloned())
+                    .signal(self.signals.iter().cloned()),
             ),
-            fence,
+            self.fence.as_mut().map(|x| &mut **x),
         )
-    }
-
-    unsafe fn dispose(self: Box<Self>, factory: &mut Factory<B>, aux: &T) {
-        N::dispose(self.0, factory, aux);
     }
 }
 
@@ -298,13 +208,19 @@ pub trait NodeBuilder<B: Backend, T: ?Sized>: std::fmt::Debug {
     fn family(&self, factory: &mut Factory<B>, families: &Families<B>) -> Option<FamilyId>;
 
     /// Get buffer accessed by the node.
-    fn buffers(&self) -> Vec<(BufferId, BufferAccess)>;
+    fn buffers(&self) -> Vec<(BufferId, BufferAccess)> {
+        Vec::new()
+    }
 
     /// Get images accessed by the node.
-    fn images(&self) -> Vec<(ImageId, ImageAccess)>;
+    fn images(&self) -> Vec<(ImageId, ImageAccess)> {
+        Vec::new()
+    }
 
     /// Indices of nodes this one dependes on.
-    fn dependencies(&self) -> Vec<NodeId>;
+    fn dependencies(&self) -> Vec<NodeId> {
+        Vec::new()
+    }
 
     /// Build node.
     fn build<'a>(
@@ -385,50 +301,6 @@ where
     pub fn with_dependency(mut self, dependency: NodeId) -> Self {
         self.add_dependency(dependency);
         self
-    }
-}
-
-impl<B, T, N> NodeBuilder<B, T> for DescBuilder<B, T, N>
-where
-    B: Backend,
-    T: ?Sized,
-    N: NodeDesc<B, T>,
-{
-    fn family(&self, _factory: &mut Factory<B>, families: &Families<B>) -> Option<FamilyId> {
-        families.with_capability::<<N::Node as Node<B, T>>::Capability>()
-    }
-
-    fn buffers(&self) -> Vec<(BufferId, BufferAccess)> {
-        let desc_buffers = self.desc.buffers();
-        assert_eq!(self.buffers.len(), desc_buffers.len());
-
-        self.buffers.iter().cloned().zip(desc_buffers).collect()
-    }
-
-    fn images(&self) -> Vec<(ImageId, ImageAccess)> {
-        let desc_images = self.desc.images();
-        assert_eq!(self.images.len(), desc_images.len());
-
-        self.images.iter().cloned().zip(desc_images).collect()
-    }
-
-    fn dependencies(&self) -> Vec<NodeId> {
-        self.dependencies.clone()
-    }
-
-    fn build<'a>(
-        self: Box<Self>,
-        ctx: &GraphContext<B>,
-        factory: &mut Factory<B>,
-        family: &mut Family<B>,
-        queue: usize,
-        aux: &T,
-        buffers: Vec<NodeBuffer>,
-        images: Vec<NodeImage>,
-    ) -> Result<Box<dyn DynNode<B, T>>, NodeBuildError> {
-        Ok(Box::new((self.desc.build(
-            ctx, factory, family, queue, aux, buffers, images,
-        )?,)))
     }
 }
 

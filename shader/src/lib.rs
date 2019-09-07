@@ -85,7 +85,7 @@ mod serde_spirv {
     {
         // Via the serde::Deserialize impl for &[u8].
         let bytes: &[u8] = serde::Deserialize::deserialize(deserializer)?;
-        gfx_hal::read_spirv(std::io::Cursor::new(bytes)).map_err(serde::de::Error::custom)
+        gfx_hal::pso::read_spirv(std::io::Cursor::new(bytes)).map_err(serde::de::Error::custom)
     }
 }
 

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use {
     crate::{
         chain,
@@ -7,7 +8,7 @@ use {
         memory::Data,
         node::{
             BufferBarrier, DynNode, ImageBarrier, NodeBuffer, NodeBuildError, NodeBuilder,
-            NodeImage,
+            NodeContext, NodeImage,
         },
         resource::{
             Buffer, BufferCreationError, BufferInfo, Handle, Image, ImageCreationError, ImageInfo,
@@ -36,6 +37,12 @@ pub struct Graph<B: Backend, T: ?Sized> {
     fences: Vec<Fences<B>>,
     inflight: u32,
     ctx: GraphContext<B>,
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+enum ResourceId {
+    Image(ImageId),
+    Buffer(BufferId),
 }
 
 device_owned!(Graph<B, T: ?Sized>);
@@ -200,41 +207,38 @@ where
                 None
             };
 
+            let waits = submission
+                .sync()
+                .wait
+                .iter()
+                .map(|wait| {
+                    log::trace!("Node {} waits for {}", submission.node(), *wait.semaphore());
+                    (&semaphores[*wait.semaphore()], wait.stage())
+                })
+                .collect::<smallvec::SmallVec<[_; 16]>>();
+            let signals = submission
+                .sync()
+                .signal
+                .iter()
+                .map(|signal| {
+                    log::trace!("Node {} signals {}", submission.node(), *signal.semaphore());
+                    &semaphores[*signal.semaphore()]
+                })
+                .collect::<smallvec::SmallVec<[_; 16]>>();
+
+            let ctx = NodeContext {
+                graph_ctx: &self.ctx,
+                factory: &factory,
+                queue: families.family_by_index_mut(queue.0).queue_mut(queue.1),
+                aux,
+                frames: &self.frames,
+                waits,
+                signals,
+                fence,
+            };
+
             unsafe {
-                node.run(
-                    &self.ctx,
-                    factory,
-                    families.family_by_index_mut(queue.0).queue_mut(queue.1),
-                    aux,
-                    &self.frames,
-                    &submission
-                        .sync()
-                        .wait
-                        .iter()
-                        .map(|wait| {
-                            log::trace!(
-                                "Node {} waits for {}",
-                                submission.node(),
-                                *wait.semaphore()
-                            );
-                            (&semaphores[*wait.semaphore()], wait.stage())
-                        })
-                        .collect::<smallvec::SmallVec<[_; 16]>>(),
-                    &submission
-                        .sync()
-                        .signal
-                        .iter()
-                        .map(|signal| {
-                            log::trace!(
-                                "Node {} signals {}",
-                                submission.node(),
-                                *signal.semaphore()
-                            );
-                            &semaphores[*signal.semaphore()]
-                        })
-                        .collect::<smallvec::SmallVec<[_; 16]>>(),
-                    fence,
-                )
+                node.run(ctx);
             }
         }
 
@@ -288,6 +292,7 @@ pub struct GraphBuilder<B: Backend, T: ?Sized> {
     nodes: Vec<Box<dyn NodeBuilder<B, T>>>,
     buffers: Vec<BufferInfo>,
     images: Vec<(ImageInfo, Option<gfx_hal::command::ClearValue>)>,
+    dependencies: Vec<Vec<usize>>,
     frames_in_flight: u32,
 }
 
@@ -302,6 +307,7 @@ where
             nodes: Vec::new(),
             buffers: Vec::new(),
             images: Vec::new(),
+            dependencies: Vec::new(),
             frames_in_flight: 3,
         }
     }
@@ -341,6 +347,14 @@ where
         ImageId(self.images.len() - 1)
     }
 
+    /// Add control flow dependency between two nodes in the graph. The dependency is guaranteed to run before dependant node.
+    pub fn add_dependency(&mut self, dependant_node: NodeId, dependency: NodeId) {
+        let deps = &mut self.dependencies[dependant_node.0];
+        if !deps.contains(&dependency.0) {
+            deps.push(dependency.0);
+        }
+    }
+
     /// Add node to the graph.
     pub fn add_node<N: NodeBuilder<B, T> + 'static>(&mut self, builder: N) -> NodeId {
         self.add_dyn_node(Box::new(builder))
@@ -349,6 +363,7 @@ where
     /// Add boxed node to the graph.
     pub fn add_dyn_node(&mut self, builder: Box<dyn NodeBuilder<B, T> + 'static>) -> NodeId {
         self.nodes.push(builder);
+        self.dependencies.push(Vec::new());
         NodeId(self.nodes.len() - 1)
     }
 
@@ -378,12 +393,23 @@ where
         profile_scope!("build");
 
         log::trace!("Schedule nodes execution");
+        let mut resource_writers: HashMap<ResourceId, usize> = HashMap::new();
         let chain_nodes: Vec<chain::Node> = {
             profile_scope!("schedule_nodes");
             self.nodes
                 .iter()
+                .zip(self.dependencies.into_iter())
                 .enumerate()
-                .map(|(i, b)| make_chain_node(&**b, i, factory, families))
+                .map(|(i, (node_builder, dependencies))| {
+                    make_chain_node(
+                        &**node_builder,
+                        i,
+                        factory,
+                        families,
+                        &mut resource_writers,
+                        dependencies,
+                    )
+                })
                 .collect()
         };
 
@@ -565,9 +591,11 @@ fn build_node<'a, B: Backend, T: ?Sized>(
 
 fn make_chain_node<B, T>(
     builder: &dyn NodeBuilder<B, T>,
-    id: usize,
+    node_id: usize,
     factory: &mut Factory<B>,
     families: &Families<B>,
+    resource_writers: &mut HashMap<ResourceId, usize>,
+    mut dependencies: Vec<usize>,
 ) -> chain::Node
 where
     B: Backend,
@@ -575,13 +603,34 @@ where
 {
     let buffers = builder.buffers();
     let images = builder.images();
+    dependencies.extend(builder.dependencies().into_iter().map(|d| d.0));
+
+    let mut extend_deps = |write_access: bool, key: ResourceId| {
+        let last_id = if write_access {
+            resource_writers.insert(key, node_id)
+        } else {
+            resource_writers.get(&key).copied()
+        };
+
+        match last_id {
+            Some(id) if id != node_id => {
+                dependencies.push(id);
+            }
+            _ => {}
+        }
+    };
+
     chain::Node {
-        id,
+        id: node_id,
         family: QueueFamilyId(builder.family(factory, families).unwrap().index),
-        dependencies: builder.dependencies().into_iter().map(|id| id.0).collect(),
         buffers: buffers
             .into_iter()
             .map(|(id, access)| {
+                use gfx_hal::buffer::Access;
+                let write_access = access
+                    .access
+                    .contains(Access::MEMORY_WRITE | Access::SHADER_WRITE | Access::TRANSFER_WRITE);
+                extend_deps(write_access, ResourceId::Buffer(id));
                 (
                     chain::Id(id.0),
                     chain::BufferState {
@@ -596,6 +645,16 @@ where
         images: images
             .into_iter()
             .map(|(id, access)| {
+                use gfx_hal::image::Access;
+                let write_access = access.access.contains(
+                    Access::COLOR_ATTACHMENT_WRITE
+                        | Access::DEPTH_STENCIL_ATTACHMENT_WRITE
+                        | Access::HOST_WRITE
+                        | Access::MEMORY_WRITE
+                        | Access::SHADER_WRITE
+                        | Access::TRANSFER_WRITE,
+                );
+                extend_deps(write_access, ResourceId::Image(id));
                 (
                     chain::Id(id.0),
                     chain::ImageState {
@@ -607,5 +666,6 @@ where
                 )
             })
             .collect(),
+        dependencies,
     }
 }

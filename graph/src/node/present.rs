@@ -2,18 +2,17 @@
 
 use crate::{
     command::{
-        CommandBuffer, CommandPool, ExecutableState, Families, Family, FamilyId, Fence, MultiShot,
-        PendingState, Queue, SimultaneousUse, Submission, Submit,
+        CommandBuffer, CommandPool, ExecutableState, Families, Family, FamilyId, MultiShot,
+        PendingState, SimultaneousUse, Submission, Submit,
     },
     factory::Factory,
-    frame::Frames,
     graph::GraphContext,
     node::{
         gfx_acquire_barriers, gfx_release_barriers, BufferAccess, DynNode, ImageAccess, NodeBuffer,
-        NodeBuildError, NodeBuilder, NodeImage,
+        NodeBuildError, NodeBuilder, NodeContext, NodeImage,
     },
     wsi::{Surface, Target},
-    BufferId, ImageId, NodeId,
+    BufferId, ImageId,
 };
 
 #[derive(Debug)]
@@ -86,7 +85,6 @@ where
         PresentBuilder {
             surface,
             image,
-            dependencies: Vec::new(),
             image_count,
             img_count_caps,
             present_mode,
@@ -265,7 +263,6 @@ pub struct PresentBuilder<B: gfx_hal::Backend> {
     img_count_caps: std::ops::RangeInclusive<u32>,
     present_modes_caps: Vec<gfx_hal::window::PresentMode>,
     present_mode: gfx_hal::window::PresentMode,
-    dependencies: Vec<NodeId>,
     blit_filter: gfx_hal::image::Filter,
 }
 
@@ -273,20 +270,6 @@ impl<B> PresentBuilder<B>
 where
     B: gfx_hal::Backend,
 {
-    /// Add dependency.
-    /// Node will be placed after its dependencies.
-    pub fn add_dependency(&mut self, dependency: NodeId) -> &mut Self {
-        self.dependencies.push(dependency);
-        self
-    }
-
-    /// Add dependency.
-    /// Node will be placed after its dependencies.
-    pub fn with_dependency(mut self, dependency: NodeId) -> Self {
-        self.add_dependency(dependency);
-        self
-    }
-
     /// Request a number of images in the swapchain. This is not guaranteed
     /// to be the final image count, but it will be if supported by the hardware.
     ///
@@ -380,10 +363,6 @@ where
         )]
     }
 
-    fn dependencies(&self) -> Vec<NodeId> {
-        self.dependencies.clone()
-    }
-
     fn build<'a>(
         self: Box<Self>,
         ctx: &GraphContext<B>,
@@ -453,17 +432,7 @@ where
     B: gfx_hal::Backend,
     T: ?Sized,
 {
-    unsafe fn run<'a>(
-        &mut self,
-        ctx: &GraphContext<B>,
-        factory: &Factory<B>,
-        queue: &mut Queue<B>,
-        _aux: &T,
-        _frames: &Frames<B>,
-        waits: &[(&'a B::Semaphore, gfx_hal::pso::PipelineStage)],
-        signals: &[&'a B::Semaphore],
-        mut fence: Option<&mut Fence<B>>,
-    ) {
+    unsafe fn run<'a>(&mut self, mut ctx: NodeContext<'_, B, T>) {
         loop {
             match self.target.next_image(&self.free_acquire) {
                 Ok(next) => {
@@ -471,20 +440,22 @@ where
                     let ref mut for_image = self.per_image[next[0] as usize];
                     core::mem::swap(&mut for_image.acquire, &mut self.free_acquire);
 
-                    queue.submit(
+                    ctx.queue.submit(
                         Some(
                             Submission::new()
                                 .submits(Some(&for_image.submit))
-                                .wait(waits.iter().cloned().chain(Some((
+                                .wait(ctx.waits.iter().cloned().chain(Some((
                                     &for_image.acquire,
                                     gfx_hal::pso::PipelineStage::TRANSFER,
                                 ))))
-                                .signal(signals.iter().cloned().chain(Some(&for_image.release))),
+                                .signal(
+                                    ctx.signals.iter().cloned().chain(Some(&for_image.release)),
+                                ),
                         ),
-                        fence.take(),
+                        ctx.fence.take(),
                     );
 
-                    match next.present(queue.raw(), Some(&for_image.release)) {
+                    match next.present(ctx.queue.raw(), Some(&for_image.release)) {
                         Ok(_) => break,
                         Err(e) => {
                             log::debug!(
@@ -508,9 +479,10 @@ where
             // The code has to execute after match due to mutable aliasing issues.
 
             // TODO: use retired swapchains once available in hal and remove that wait
-            factory.wait_idle().unwrap();
+            ctx.factory.wait_idle().unwrap();
 
             let extent = ctx
+                .graph_ctx
                 .get_image(self.input_image.id)
                 .expect("Context must contain node's image")
                 .kind()
@@ -518,18 +490,18 @@ where
                 .into();
 
             self.target
-                .recreate(factory.physical(), factory.device(), extent)
+                .recreate(ctx.factory.physical(), ctx.factory.device(), extent)
                 .expect("Failed recreating swapchain");
 
             for data in self.per_image.drain(..) {
-                data.dispose(factory, &mut self.pool);
+                data.dispose(ctx.factory, &mut self.pool);
             }
 
             self.per_image = create_per_image_data(
-                ctx,
+                &ctx.graph_ctx,
                 &self.input_image,
                 &mut self.pool,
-                factory,
+                ctx.factory,
                 &self.target,
                 self.blit_filter,
             );
