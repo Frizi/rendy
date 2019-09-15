@@ -105,9 +105,88 @@ impl<'a, T, I, P> ReadyRef<'a, T, I, P> {
             .push_back((finish(self.value), self.index, self.frame))
     }
 
+    /// Take the value out of the ref.
+    /// It will have to be later returned to cirque.
+    pub fn detach(self) -> DetachedReadyRef<T, I, P> {
+        DetachedReadyRef {
+            relevant: self.relevant,
+            value: self.value,
+            index: self.index,
+            marker: std::marker::PhantomData,
+        }
+    }
+
     /// Get ref index.
     pub fn index(&self) -> usize {
         self.index
+    }
+}
+
+/// A value taken out from  `Cirque`.
+/// It is in ready state.
+#[derive(Debug)]
+pub struct DetachedReadyRef<T, I = T, P = T> {
+    relevant: relevant::Relevant,
+    value: T,
+    index: usize,
+    marker: std::marker::PhantomData<(fn() -> I, P)>,
+}
+
+impl<T, I, P> DetachedReadyRef<T, I, P> {
+    /// Reattach value to cirque.
+    /// Safety: Value must be returned to cirque it was taken from.
+    pub unsafe fn attach<'a, B: gfx_hal::Backend>(
+        self,
+        cirque: &'a mut Cirque<T, I, P>,
+        frames: &Frames<B>,
+    ) -> ReadyRef<'a, T, I, P> {
+        ReadyRef {
+            relevant: self.relevant,
+            cirque: cirque,
+            value: self.value,
+            frame: frames.next(),
+            index: self.index,
+        }
+    }
+
+    /// Finish using this value without putting it back into cirque yet.
+    pub fn finish(self, finish: impl FnOnce(T) -> P) -> DetachedFinishRef<T, I, P> {
+        DetachedFinishRef {
+            relevant: self.relevant,
+            value: finish(self.value),
+            index: self.index,
+            marker: std::marker::PhantomData,
+        }
+    }
+}
+
+/// A value taken out from  `Cirque`.
+/// It is in finish state.
+#[derive(Debug)]
+pub struct DetachedFinishRef<T, I = T, P = T> {
+    relevant: relevant::Relevant,
+    value: P,
+    index: usize,
+    marker: std::marker::PhantomData<(T, fn() -> I)>,
+}
+
+impl<T, I, P> DetachedFinishRef<T, I, P> {
+    /// Reattach value to cirque.
+    /// Safety: Value must be returned to cirque it was taken from.
+    pub unsafe fn attach<B: gfx_hal::Backend>(
+        self,
+        cirque: &mut Cirque<T, I, P>,
+        frames: &Frames<B>,
+    ) {
+        self.relevant.dispose();
+        cirque
+            .pending
+            .push_back((self.value, self.index, frames.next()))
+    }
+
+    /// Dispose of the `DetachedFinishRef`.
+    pub fn dispose(self, dispose: impl FnOnce(P)) {
+        dispose(self.value);
     }
 }
 

@@ -1,6 +1,7 @@
 //! Image usage, format, kind, extent, creation-info and wrappers.
 
 pub use rendy_core::hal::image::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use {
     crate::{
@@ -43,11 +44,20 @@ pub struct ImageInfo {
 #[derive(Debug)]
 pub struct Image<B: Backend> {
     device: DeviceId,
+    instance: usize,
     raw: B::Image,
     block: Option<MemoryBlock<B>>,
     info: ImageInfo,
     relevant: Relevant,
 }
+
+impl<B: Backend> PartialEq for Image<B> {
+    fn eq(&self, other: &Image<B>) -> bool {
+        self.instance == other.instance
+    }
+}
+
+static INSTANCE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 device_owned!(Image<B>);
 /// Alias for the error to create an image.
@@ -109,6 +119,7 @@ where
 
         Ok(Image {
             device: device.id(),
+            instance: INSTANCE_COUNTER.fetch_add(1, Ordering::Relaxed),
             raw: img,
             block: Some(block),
             info,
@@ -116,10 +127,16 @@ where
         })
     }
 
+    /// Retreive unique instance identifier
+    pub fn instance(&self) -> usize {
+        self.instance
+    }
+
     /// Create image handler for swapchain image.
     pub unsafe fn create_from_swapchain(device: DeviceId, info: ImageInfo, raw: B::Image) -> Self {
         Image {
             device,
+            instance: INSTANCE_COUNTER.fetch_add(1, Ordering::Relaxed),
             raw,
             block: None,
             info,

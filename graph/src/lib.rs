@@ -32,6 +32,7 @@ pub struct ImageId(usize);
 pub struct NodeId(usize);
 
 mod graph;
+pub mod new;
 mod node;
 
 pub use self::{graph::*, node::*};
