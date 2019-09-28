@@ -2,15 +2,29 @@ use bitflags::bitflags;
 
 /// Id of the buffer in graph.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct BufferId(usize);
+pub struct BufferId(pub(super) usize);
 
 /// Id of the image (or swapchain) in graph.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ImageId(usize);
+pub struct ImageId(pub(super) usize);
 
 /// Id of virtual resource in graph.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct VirtualId(usize);
+pub struct VirtualId(pub(super) usize);
+
+#[derive(Debug, Clone, Copy)]
+pub struct ImageInfo {
+    kind: gfx_hal::image::Kind,
+    levels: gfx_hal::image::Level,
+    format: gfx_hal::format::Format,
+    clear: Option<gfx_hal::command::ClearValue>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct BufferInfo {
+    size: u64,
+    clear: Option<u32>,
+}
 
 bitflags!(
     /// Buffer access flags.
@@ -48,7 +62,7 @@ bitflags!(
 );
 
 impl NodeImageAccess {
-    fn is_write(&self) -> bool {
+    pub fn is_write(&self) -> bool {
         self.contains(
             Self::STORAGE_IMAGE_WRITE
                 | Self::COLOR_ATTACHMENT_WRITE
@@ -59,7 +73,7 @@ impl NodeImageAccess {
 }
 
 impl NodeBufferAccess {
-    fn is_write(&self) -> bool {
+    pub fn is_write(&self) -> bool {
         self.contains(
             Self::STORAGE_BUFFER_WRITE | Self::STORAGE_TEXEL_BUFFER_WRITE | Self::TRANSFER_WRITE,
         )
@@ -70,4 +84,10 @@ impl NodeBufferAccess {
 pub enum NodeVirtualAccess {
     Read,
     Write,
+}
+
+impl NodeVirtualAccess {
+    pub fn is_write(&self) -> bool {
+        *self == NodeVirtualAccess::Write
+    }
 }

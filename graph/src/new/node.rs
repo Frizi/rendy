@@ -1,6 +1,7 @@
 use {
-    super::resources::{
-        BufferId, ImageId, NodeBufferAccess, NodeImageAccess, NodeVirtualAccess, VirtualId,
+    super::{
+        graph::NodeContext,
+        resources::{BufferId, ImageId},
     },
     crate::{
         command::{Capability, Families, Family, FamilyId, Fence, Queue, Submission, Submittable},
@@ -10,16 +11,12 @@ use {
         wsi::SwapchainError,
     },
     gfx_hal::{queue::QueueFamilyId, Backend},
-    std::{
-        any::{Any, TypeId},
-        collections::HashMap,
-        marker::PhantomData,
-    },
+    std::{any::Any, collections::HashMap, marker::PhantomData},
 };
 
 /// Id of the node in graph.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct NodeId(usize);
+pub struct NodeId(pub(super) usize);
 
 /// Node is a basic building block of rendering graph.
 pub trait Node<B: Backend, T: ?Sized>: std::fmt::Debug + Send + Sync {
@@ -29,9 +26,9 @@ pub trait Node<B: Backend, T: ?Sized>: std::fmt::Debug + Send + Sync {
     /// Returns a rendering job that is going to be scheduled for execution if anything reads resources the node have declared to write.
     fn construct(
         &mut self,
-        ctx: NodeContext<'_, B>,
+        ctx: &mut NodeContext<'_, '_, B>,
         aux: &T,
-    ) -> Result<(Self::Outputs, NodeExecution<B, T>), NodeConstructionError>;
+    ) -> Result<(<Self::Outputs as OutputList>::Data, NodeExecution<B, T>), NodeConstructionError>;
 
     /// Dispose of the node.
     /// Called after device idle
@@ -39,16 +36,37 @@ pub trait Node<B: Backend, T: ?Sized>: std::fmt::Debug + Send + Sync {
 }
 
 /// Holds the output variable data of all constructed nodes.
+#[derive(Debug, Default)]
 pub struct OutputStore {
-    outputs: HashMap<NodeId, Vec<(TypeId, Box<dyn Any>)>>,
+    outputs: HashMap<NodeId, Vec<Box<dyn Any>>>,
+}
+
+impl OutputStore {
+    /// Create new output store
+    pub fn new() -> Self {
+        Default::default()
+    }
+
+    pub(crate) fn get<T: Any>(&self, param: Parameter<T>) -> Option<&T> {
+        let ParameterId(node_id, idx) = param.0;
+        self.outputs
+            .get(&node_id)
+            .and_then(|vec| vec.get(idx as usize))
+            .and_then(|v| v.downcast_ref())
+    }
+
+    fn set_all(&mut self, node: NodeId, vals: impl Iterator<Item = Box<dyn Any>>) {
+        let vec = self.outputs.entry(node).or_insert_with(|| Vec::new());
+        vec.clear();
+        vec.extend(vals);
+    }
 }
 
 /// Trait-object safe `Node`.
 pub trait DynNode<B: Backend, T: ?Sized>: std::fmt::Debug + Send + Sync {
     fn construct(
         &mut self,
-        output_store: &mut OutputStore,
-        ctx: NodeContext<'_, B>,
+        ctx: &mut NodeContext<'_, '_, B>,
         aux: &T,
     ) -> Result<NodeExecution<B, T>, NodeConstructionError>;
 
@@ -61,14 +79,13 @@ pub trait DynNode<B: Backend, T: ?Sized>: std::fmt::Debug + Send + Sync {
 impl<B: Backend, T: ?Sized, N: Node<B, T>> DynNode<B, T> for N {
     fn construct(
         &mut self,
-        _output_store: &mut OutputStore,
-        ctx: NodeContext<'_, B>,
+        ctx: &mut NodeContext<'_, '_, B>,
         aux: &T,
     ) -> Result<NodeExecution<B, T>, NodeConstructionError> {
-        let (_outs, _exec) = N::construct(self, ctx, aux)?;
-        unimplemented!()
-        // output_store.store(outs);
-        // Ok(exec)
+        let (outs, exec) = N::construct(self, ctx, aux)?;
+        let outputs_iterator = N::Outputs::iter(outs);
+        ctx.run.output_store.set_all(ctx.id, outputs_iterator);
+        Ok(exec)
     }
 
     unsafe fn dispose(self: Box<Self>, factory: &mut Factory<B>, aux: &T) {
@@ -78,28 +95,71 @@ impl<B: Backend, T: ?Sized, N: Node<B, T>> DynNode<B, T> for N {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ParameterId(NodeId, u32);
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
-pub struct Parameter<T>(ParameterId, PhantomData<T>);
+
+#[derive(derivative::Derivative)]
+#[derivative(
+    Debug(bound = ""),
+    Clone(bound = ""),
+    Copy(bound = ""),
+    Eq(bound = ""),
+    PartialEq(bound = ""),
+    Hash(bound = "")
+)]
+pub struct Parameter<T: Any>(pub(super) ParameterId, PhantomData<T>);
+
+#[doc(hidden)]
+#[allow(missing_debug_implementations, missing_copy_implementations)]
+pub struct InternalUse(pub(super) ());
 
 pub trait OutputList {
-    type Data;
-
+    type Data: Any;
+    type Iter: Iterator<Item = Box<dyn Any>>;
+    /// Get number of outputs.
     fn size() -> u32;
+
+    /// Create the parameters. Intended only for internal use.
+    fn instance(node_id: NodeId, i: u32, _internal: InternalUse) -> Self;
+
+    /// Convert output data into iterator over dynamic types;
+    fn iter(data: Self::Data) -> Self::Iter;
 }
 
-impl<T> OutputList for Parameter<T> {
+impl<T: Any> OutputList for Parameter<T> {
     type Data = T;
+    type Iter = std::iter::Once<Box<dyn Any>>;
     fn size() -> u32 {
         1
+    }
+    fn instance(node_id: NodeId, i: u32, _internal: InternalUse) -> Self {
+        Parameter(ParameterId(node_id, i), PhantomData)
+    }
+    fn iter(data: Self::Data) -> Self::Iter {
+        std::iter::once(Box::new(data))
     }
 }
 
 impl OutputList for () {
     type Data = ();
+    type Iter = std::iter::Empty<Box<dyn Any>>;
     fn size() -> u32 {
         0
     }
+    fn instance(_node_id: NodeId, _i: u32, _internal: InternalUse) -> Self {
+        ()
+    }
+    fn iter(_data: Self::Data) -> Self::Iter {
+        std::iter::empty()
+    }
 }
+
+// TODO: implement the OutputList with macro.
+
+// macro_rules! recursive_iter {
+//     (@value $first:expr, $($rest:expr),*) => { $first.chain(recursive_iter!(@value $($rest),*)) };
+//     (@value $last:expr) => { $last };
+//     (@type $first:ty, $($rest:ty),*) => { std::iter::Chain<$first, recursive_iter!(@type $($rest),*)> };
+//     (@type $last:ty) => { $last };
+// }
 
 impl<A, B> OutputList for (A, B)
 where
@@ -107,8 +167,22 @@ where
     B: OutputList,
 {
     type Data = (A::Data, B::Data);
+    type Iter = std::iter::Chain<A::Iter, B::Iter>;
     fn size() -> u32 {
         A::size() + B::size()
+    }
+    fn instance(node_id: NodeId, i: u32, _internal: InternalUse) -> Self {
+        let a = A::instance(node_id, i, InternalUse(()));
+        let i = i + A::size();
+        let b = B::instance(node_id, i, InternalUse(()));
+        // let i = i + B::size();
+        (a, b)
+    }
+    fn iter(data: Self::Data) -> Self::Iter {
+        let (a, b) = data;
+        let a = A::iter(a);
+        let b = B::iter(b);
+        a.chain(b)
     }
 }
 
@@ -119,17 +193,42 @@ where
     C: OutputList,
 {
     type Data = (A::Data, B::Data, C::Data);
+    type Iter = std::iter::Chain<A::Iter, std::iter::Chain<B::Iter, C::Iter>>;
     fn size() -> u32 {
         A::size() + B::size() + C::size()
     }
+    fn instance(node_id: NodeId, i: u32, _internal: InternalUse) -> Self {
+        let a = A::instance(node_id, i, InternalUse(()));
+        let i = i + A::size();
+        let b = B::instance(node_id, i, InternalUse(()));
+        let i = i + B::size();
+        let c = C::instance(node_id, i, InternalUse(()));
+        // let i = i + C::size();
+        (a, b, c)
+    }
+    fn iter(data: Self::Data) -> Self::Iter {
+        let (a, b, c) = data;
+        let a = A::iter(a);
+        let b = B::iter(b);
+        let c = C::iter(c);
+        a.chain(b.chain(c))
+    }
 }
 
+#[derive(Debug, Clone, Copy)]
+/// Error during node construction phase in the graph.
 pub enum NodeConstructionError {
+    /// Node tried to read a variable that was never written to.
+    /// This can only happen when node that produces this variable have failed to construct.
     VariableReadFailed(ParameterId),
 }
 
+#[derive(Debug, Clone, Copy)]
+/// Error during node execution phase in the graph.
 pub enum NodeExecutionError {
+    /// Node tried to access an image that was not registered in construction phase.
     UnscheduledImage(ImageId),
+    /// Node tried to access a buffer that was not registered in construction phase.
     UnscheduledBuffer(BufferId),
 }
 
@@ -190,7 +289,7 @@ where
     }
 }
 
-pub trait DynNodeBuilder<B: Backend, T: ?Sized> {
+pub trait DynNodeBuilder<B: Backend, T: ?Sized>: std::fmt::Debug {
     fn num_outputs(&self) -> u32;
     fn build(
         self: Box<Self>,
@@ -223,28 +322,61 @@ impl<B: Backend, T: ?Sized, N: NodeBuilder<B, T>> DynNodeBuilder<B, T> for N {
 
 pub type ExecResult = Result<(), NodeExecutionError>;
 
+/// Render pass attachments declared for use in given RenderPass node execution phase.
+/// All resources used as attachment are automatically registered with required access rules.
+#[derive(Default, Debug)]
+pub struct Attachments {
+    /// Images to use as input attachments
+    pub inputs: Vec<ImageId>,
+    /// Images to use as color attachments
+    pub colors: Vec<ImageId>,
+    /// Optional image to use as depth attachment
+    pub depth: Option<ImageId>,
+}
+
 pub enum NodeExecution<'n, B: Backend, T: ?Sized> {
-    RenderPass(Box<dyn for<'a> FnOnce(ExecPassContext<'a, B>, &'a T) -> ExecResult + 'n>),
+    /// This node has no evaluation phase.
+    /// The resource access rules still apply as if the evaluation phase had to take place.
+    None,
+    /// Node evaluated in a context of rendering pass. Must define it's attachment layout before execution,
+    /// Can only operate on secondary command buffers.
+    RenderPass(
+        Attachments,
+        Box<dyn for<'a> FnOnce(ExecPassContext<'a, B>, &'a T) -> ExecResult + 'n>,
+    ),
+    /// The most general rendering node, must manually submit to do any work.
     General(Box<dyn for<'a> FnOnce(ExecContext<'a, B>, &'a T) -> ExecResult + 'n>),
+    /// Like general, but always scheduled after other non-output nodes.
+    /// All resources read by output nodes are considered root, which guarantees evaluation of whoever writes them last.
+    Output(Box<dyn for<'a> FnOnce(ExecContext<'a, B>, &'a T) -> ExecResult + 'n>),
 }
 
 impl<'n, B: Backend, T: ?Sized> std::fmt::Debug for NodeExecution<'n, B, T> {
     fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        fmt.debug_tuple(match &self {
-            NodeExecution::RenderPass(_) => "RenderPass",
-            NodeExecution::General(_) => "General",
-        })
-        .field(&format_args!(".."))
-        .finish()
+        match &self {
+            NodeExecution::None => fmt.debug_tuple("None").finish(),
+            NodeExecution::RenderPass(attachments, _) => {
+                fmt.debug_tuple("RenderPass").field(attachments).finish()
+            }
+            NodeExecution::Output(_) => fmt.debug_tuple("General").finish(),
+            NodeExecution::General(_) => fmt.debug_tuple("General").finish(),
+        }
     }
 }
 
 impl<'n, B: Backend, T: ?Sized> NodeExecution<'n, B, T> {
-    pub fn pass<F>(pass_closure: F) -> Self
+    pub fn is_output(&self) -> bool {
+        match self {
+            NodeExecution::Output(_) => true,
+            _ => false,
+        }
+    }
+
+    pub fn pass<F>(attachments: Attachments, pass_closure: F) -> Self
     where
         F: for<'a> FnOnce(ExecPassContext<'a, B>, &'a T) -> ExecResult + 'n,
     {
-        Self::RenderPass(Box::new(pass_closure))
+        Self::RenderPass(attachments, Box::new(pass_closure))
     }
 
     pub fn general<F>(general_closure: F) -> Self
@@ -255,64 +387,7 @@ impl<'n, B: Backend, T: ?Sized> NodeExecution<'n, B, T> {
     }
 }
 
-// pub trait NodeExecution<'a, B: Backend, T: ?Sized>: std::fmt::Debug + Send + Sync {
-//     /// Record commands required by node.
-//     /// Recorded buffers go into `submits`.
-//     unsafe fn run(self: Box<Self>, ctx: ExecContext<'_, B>, aux: &T) -> ExecResult;
-// }
-
-/// A context for rendergraph node construction phase. Contains all data that the node
-/// get access to and contains ready-made methods for common operations.
 #[derive(Debug)]
-pub struct NodeContext<'a, B: Backend> {
-    factory: &'a Factory<B>,
-    images: Vec<(ImageId, NodeImageAccess)>,
-    buffers: Vec<(BufferId, NodeBufferAccess)>,
-    virtuals: Vec<(VirtualId, NodeVirtualAccess)>,
-}
-
-impl<'a, B: Backend> NodeContext<'a, B> {
-    pub fn get_parameter<T>(&self, _id: Parameter<T>) -> Result<&T, NodeConstructionError> {
-        unimplemented!()
-        // Err(NodeConstructionError::VariableReadFailed(id.0))
-    }
-
-    /// Create new image owned by graph.
-    pub fn create_image(
-        &mut self,
-        _kind: gfx_hal::image::Kind,
-        _levels: gfx_hal::image::Level,
-        _format: gfx_hal::format::Format,
-    ) -> ImageId {
-        unimplemented!()
-    }
-
-    /// Create new buffer owned by graph.
-    pub fn create_buffer(&mut self, _size: u64) -> BufferId {
-        unimplemented!()
-    }
-
-    /// Create non-data dependency target. A virtual resource intended to
-    /// describe dependencies between rendering nodes without carrying any data.
-    pub fn create_virtual(&mut self) -> VirtualId {
-        unimplemented!()
-    }
-
-    pub fn use_virtual(&mut self, id: VirtualId, access: NodeVirtualAccess) {
-        self.virtuals.push((id, access));
-    }
-
-    /// Declare usage of image by the node
-    pub fn use_image(&mut self, id: ImageId, access: NodeImageAccess) {
-        self.images.push((id, access));
-    }
-
-    /// Declare usage of buffer by the node
-    pub fn use_buffer(&mut self, id: BufferId, access: NodeBufferAccess) {
-        self.buffers.push((id, access));
-    }
-}
-
 pub struct ExecContext<'a, B: Backend> {
     factory: &'a Factory<B>,
     images: HashMap<ImageId, NodeImage<B>>,
@@ -360,8 +435,9 @@ impl<'a, B: Backend> ExecContext<'a, B> {
     }
 }
 
+#[derive(Debug)]
 pub struct ExecPassContext<'a, B: Backend> {
-    general_ctx: ExecContext<'a, B>,
+    _general_ctx: ExecContext<'a, B>,
 }
 
 impl<'a, B: Backend> ExecContext<'a, B> {}
@@ -437,6 +513,9 @@ pub struct NodeImage<B: Backend> {
     /// Node implementation must insert it after last command that uses the image.
     /// Barrier must be inserted even if this node doesn't use the image.
     pub release: Option<ImageBarrier>,
+
+    /// Specify that node should clear image to this value.
+    pub clear: Option<gfx_hal::command::ClearValue>,
 }
 
 /// Buffer shared between nodes.
@@ -459,6 +538,9 @@ pub struct NodeBuffer<B: Backend> {
     /// Node implementation must insert it after last command that uses the buffer.
     /// Barrier must be inserted even if this node doesn't use the buffer.
     pub release: Option<BufferBarrier>,
+
+    /// Specify that node should clear buffer to this value.
+    pub clear: Option<u32>,
 }
 
 /// Convert graph barriers into gfx barriers.
