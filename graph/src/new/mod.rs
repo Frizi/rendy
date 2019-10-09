@@ -1,8 +1,18 @@
+// TODO: after all required nodes are implemented, disallow dead code and remove what's left
+#![allow(dead_code)]
+
+#[cfg(test)]
+#[macro_use]
+mod test;
+
 mod graph;
+mod graph_reducer;
 mod node;
 mod nodes;
+mod pipeline;
 mod resources;
 mod track;
+mod walker;
 
 pub use graph::{Graph, GraphBuildError, GraphBuilder, GraphRunError};
 pub use nodes::*;

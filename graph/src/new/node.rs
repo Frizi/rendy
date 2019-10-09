@@ -26,7 +26,7 @@ pub trait Node<B: Backend, T: ?Sized>: std::fmt::Debug + Send + Sync {
     /// Returns a rendering job that is going to be scheduled for execution if anything reads resources the node have declared to write.
     fn construct(
         &mut self,
-        ctx: &mut NodeContext<'_, '_, B>,
+        ctx: &mut NodeContext<'_, '_, B, T>,
         aux: &T,
     ) -> Result<(<Self::Outputs as OutputList>::Data, NodeExecution<B, T>), NodeConstructionError>;
 
@@ -55,7 +55,7 @@ impl OutputStore {
             .and_then(|v| v.downcast_ref())
     }
 
-    fn set_all(&mut self, node: NodeId, vals: impl Iterator<Item = Box<dyn Any>>) {
+    pub(crate) fn set_all(&mut self, node: NodeId, vals: impl Iterator<Item = Box<dyn Any>>) {
         let vec = self.outputs.entry(node).or_insert_with(|| Vec::new());
         vec.clear();
         vec.extend(vals);
@@ -66,7 +66,7 @@ impl OutputStore {
 pub trait DynNode<B: Backend, T: ?Sized>: std::fmt::Debug + Send + Sync {
     fn construct(
         &mut self,
-        ctx: &mut NodeContext<'_, '_, B>,
+        ctx: &mut NodeContext<'_, '_, B, T>,
         aux: &T,
     ) -> Result<NodeExecution<B, T>, NodeConstructionError>;
 
@@ -79,12 +79,11 @@ pub trait DynNode<B: Backend, T: ?Sized>: std::fmt::Debug + Send + Sync {
 impl<B: Backend, T: ?Sized, N: Node<B, T>> DynNode<B, T> for N {
     fn construct(
         &mut self,
-        ctx: &mut NodeContext<'_, '_, B>,
+        ctx: &mut NodeContext<'_, '_, B, T>,
         aux: &T,
     ) -> Result<NodeExecution<B, T>, NodeConstructionError> {
         let (outs, exec) = N::construct(self, ctx, aux)?;
-        let outputs_iterator = N::Outputs::iter(outs);
-        ctx.run.output_store.set_all(ctx.id, outputs_iterator);
+        ctx.set_outputs(N::Outputs::iter(outs));
         Ok(exec)
     }
 
@@ -321,43 +320,31 @@ impl<B: Backend, T: ?Sized, N: NodeBuilder<B, T>> DynNodeBuilder<B, T> for N {
 }
 
 pub type ExecResult = Result<(), NodeExecutionError>;
-
-/// Render pass attachments declared for use in given RenderPass node execution phase.
-/// All resources used as attachment are automatically registered with required access rules.
-#[derive(Default, Debug)]
-pub struct Attachments {
-    /// Images to use as input attachments
-    pub inputs: Vec<ImageId>,
-    /// Images to use as color attachments
-    pub colors: Vec<ImageId>,
-    /// Optional image to use as depth attachment
-    pub depth: Option<ImageId>,
-}
+pub type PassFn<'n, B, T> =
+    Box<dyn for<'a> FnOnce(ExecPassContext<'a, B>, &'a T) -> ExecResult + 'n>;
+pub type GeneralFn<'n, B, T> =
+    Box<dyn for<'a> FnOnce(ExecContext<'a, B>, &'a T) -> ExecResult + 'n>;
 
 pub enum NodeExecution<'n, B: Backend, T: ?Sized> {
     /// This node has no evaluation phase.
     /// The resource access rules still apply as if the evaluation phase had to take place.
     None,
-    /// Node evaluated in a context of rendering pass. Must define it's attachment layout before execution,
+    /// Node evaluated in a context of rendering pass.
+    /// The attachment layout is determined from declared image accesses (based on read/write flags), in order of their declaration.
     /// Can only operate on secondary command buffers.
-    RenderPass(
-        Attachments,
-        Box<dyn for<'a> FnOnce(ExecPassContext<'a, B>, &'a T) -> ExecResult + 'n>,
-    ),
+    RenderPass(PassFn<'n, B, T>),
     /// The most general rendering node, must manually submit to do any work.
-    General(Box<dyn for<'a> FnOnce(ExecContext<'a, B>, &'a T) -> ExecResult + 'n>),
+    General(GeneralFn<'n, B, T>),
     /// Like general, but always scheduled after other non-output nodes.
     /// All resources read by output nodes are considered root, which guarantees evaluation of whoever writes them last.
-    Output(Box<dyn for<'a> FnOnce(ExecContext<'a, B>, &'a T) -> ExecResult + 'n>),
+    Output(GeneralFn<'n, B, T>),
 }
 
 impl<'n, B: Backend, T: ?Sized> std::fmt::Debug for NodeExecution<'n, B, T> {
     fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self {
             NodeExecution::None => fmt.debug_tuple("None").finish(),
-            NodeExecution::RenderPass(attachments, _) => {
-                fmt.debug_tuple("RenderPass").field(attachments).finish()
-            }
+            NodeExecution::RenderPass(_) => fmt.debug_tuple("RenderPass").finish(),
             NodeExecution::Output(_) => fmt.debug_tuple("General").finish(),
             NodeExecution::General(_) => fmt.debug_tuple("General").finish(),
         }
@@ -372,11 +359,11 @@ impl<'n, B: Backend, T: ?Sized> NodeExecution<'n, B, T> {
         }
     }
 
-    pub fn pass<F>(attachments: Attachments, pass_closure: F) -> Self
+    pub fn pass<F>(pass_closure: F) -> Self
     where
         F: for<'a> FnOnce(ExecPassContext<'a, B>, &'a T) -> ExecResult + 'n,
     {
-        Self::RenderPass(attachments, Box::new(pass_closure))
+        Self::RenderPass(Box::new(pass_closure))
     }
 
     pub fn general<F>(general_closure: F) -> Self

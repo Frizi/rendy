@@ -73,7 +73,7 @@ impl<B: Backend, T: ?Sized> Node<B, T> for CopyImage<B> {
 
     fn construct(
         &mut self,
-        ctx: &mut NodeContext<'_, '_, B>,
+        ctx: &mut NodeContext<'_, '_, B, T>,
         _aux: &T,
     ) -> Result<(<Self::Outputs as OutputList>::Data, NodeExecution<'_, B, T>), NodeConstructionError>
     {

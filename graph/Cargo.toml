@@ -39,3 +39,7 @@ serde = { version = "1.0", optional = true, features = ["derive"] }
 smallvec = "1.0"
 thread_profiler = "0.3"
 daggy = "0.6.0"
+petgraph = "0.4"
+
+[dev-dependencies]
+env_logger = "0.6"
