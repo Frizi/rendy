@@ -27,6 +27,12 @@ macro_rules! graph_decl {
                 .unwrap();
             graph_decl!(@decl [$graph], $($tail)*);
         };
+        (@decl [$graph:ident], @ $name:ident; $($tail:tt)*) => {
+            $graph
+                .add_edge($name, daggy::NodeIndex::new(0), $crate::new::graph::PlanEdge::Effect)
+                .unwrap();
+            graph_decl!(@decl [$graph], $($tail)*);
+        };
         (@decl [$graph:ident], $a:ident -> $b:ident = $edge:expr; $($tail:tt)*) => {
             $graph.add_edge($a, $b, $edge).unwrap_or_else(|_| {
                 panic!(

@@ -40,54 +40,6 @@ impl<B: Backend, T: ?Sized> Pipeline<B, T> {
     }
 }
 
-// // Find resource nodes that qualify as an attachment
-// #[derive(Debug)]
-// struct FindAttachmentsReducer;
-
-// impl<'a, B: Backend, T: ?Sized> Reducer<PlanNodeData<'a, B, T>, PlanEdge>
-//     for FindAttachmentsReducer
-// {
-//     fn reduce(
-//         &mut self,
-//         editor: &mut GraphEditor<'_, PlanNodeData<'a, B, T>, PlanEdge>,
-//         node: NodeIndex,
-//     ) -> Reduction {
-//         let replacement = match editor.graph().node_weight(node) {
-//             Some(PlanNodeData::Resource(ResourceId::Image(image))) => {
-//                 // Merge passes if this node represents an attachment between exactly two render passes
-
-//                 let mut writers = walk_data(editor.graph().parents(node));
-//                 let mut readers = walk_data(editor.graph().children(node));
-
-//                 let (writer_edge, _) = try_reduce!(writers.walk_next(editor.graph()));
-//                 let (reader_edge, _) = try_reduce!(readers.walk_next(editor.graph()));
-
-//                 // there is more than one edge in either direction
-//                 if readers.walk_next(editor.graph()).is_some()
-//                     || writers.walk_next(editor.graph()).is_some()
-//                 {
-//                     return Reduction::NoChange;
-//                 }
-
-//                 let read_is_attachment =
-//                     try_reduce!(editor.graph().edge_weight(reader_edge)).is_attachment_only();
-//                 let write_is_attachment =
-//                     try_reduce!(editor.graph().edge_weight(writer_edge)).is_attachment_only();
-
-//                 if read_is_attachment && write_is_attachment {
-//                     PlanNodeData::Attachment(ResourceId::Image(*image))
-//                 } else {
-//                     return Reduction::NoChange;
-//                 }
-//             }
-//             _ => return Reduction::NoChange,
-//         };
-
-//         *editor.graph_mut().node_weight_mut(node).unwrap() = replacement;
-//         Reduction::Changed
-//     }
-// }
-
 #[derive(Debug)]
 struct LowerRenderPassReducer;
 
@@ -235,38 +187,192 @@ fn walk_attachments<'w, 'a: 'w, B: Backend, T: ?Sized + 'w>(
 mod test {
     use super::*;
     use crate::new::{
+        node::PassFn,
         resources::{ImageId, NodeImageAccess, ResourceAccess},
-        test::{assert_topo_eq, test_init},
+        test::{assert_topo_eq, test_init, TestBackend},
     };
 
+    fn subpass_node(num_groups: usize) -> PlanNodeData<'static, TestBackend, ()> {
+        let mut vec: Vec<PassFn<'static, TestBackend, ()>> = Vec::with_capacity(num_groups);
+        for _ in 0..num_groups {
+            vec.push(Box::new(|_, _| Ok(())))
+        }
+        PlanNodeData::RenderSubpass(vec)
+    }
+
+    fn group_node() -> PlanNodeData<'static, TestBackend, ()> {
+        PlanNodeData::Execution(NodeExecution::RenderPass(Box::new(|_, _| Ok(()))))
+    }
+
+    fn image_node(id: usize) -> PlanNodeData<'static, TestBackend, ()> {
+        PlanNodeData::Resource(ResourceId::Image(ImageId(id)))
+    }
+
+    fn image_edge(access: NodeImageAccess) -> PlanEdge {
+        PlanEdge::Data(ResourceAccess::Image(access))
+    }
+
     #[test]
-    fn test_compound_reducer() {
+    fn test_combine_two_passes() {
         test_init();
 
         let mut graph = graph! {
-            pass1 = PlanNodeData::Execution(NodeExecution::RenderPass(Box::new(|_, _| Ok(()))));
-            res1 = PlanNodeData::Resource(ResourceId::Image(ImageId(0)));
-            pass1 -> res1 = PlanEdge::Data(ResourceAccess::Image(NodeImageAccess::COLOR_ATTACHMENT_WRITE));
+            group1 = group_node();
+            group2 = group_node();
 
-            pass2 = PlanNodeData::Execution(NodeExecution::RenderPass(Box::new(|_, _| Ok(()))));
-            res1 -> pass2 = PlanEdge::Data(ResourceAccess::Image(NodeImageAccess::COLOR_ATTACHMENT_READ));
-            @ res2 = PlanNodeData::Resource(ResourceId::Image(ImageId(0)));
-            pass2 -> res2 = PlanEdge::Data(ResourceAccess::Image(NodeImageAccess::COLOR_ATTACHMENT_WRITE));
+            color_a = image_node(0);
+            @ color_b = image_node(0);
+
+            group1 -> color_a = image_edge(NodeImageAccess::COLOR_ATTACHMENT_WRITE);
+            color_a -> group2 = image_edge(NodeImageAccess::COLOR_ATTACHMENT_READ);
+            group2 -> color_b = image_edge(NodeImageAccess::COLOR_ATTACHMENT_WRITE);
         };
 
         let expected_graph = graph! {
-            pass = PlanNodeData::RenderSubpass(vec![
-                Box::new(|_, _| Ok(())),
-                Box::new(|_, _| Ok(())),
-            ]);
-            @ attachment = PlanNodeData::Resource(ResourceId::Image(ImageId(0)));
-            pass -> attachment = PlanEdge::Data(ResourceAccess::Image(NodeImageAccess::COLOR_ATTACHMENT_WRITE));
+            pass = subpass_node(2);
+            @ color_a = image_node(0);
+            pass -> color_a = image_edge(NodeImageAccess::COLOR_ATTACHMENT_WRITE);
         };
 
         let mut reducer = GraphReducer::new()
             .with_reducer(LowerRenderPassReducer)
             .with_reducer(CombineSubpassesReducer);
         reducer.reduce_graph(&mut graph);
+
+        assert_topo_eq(&expected_graph, &graph);
+    }
+
+    #[test]
+    fn test_combine_two_passes_texture_access() {
+        test_init();
+
+        let mut graph = graph! {
+            group1 = group_node();
+            group2 = group_node();
+
+            color1 = image_node(0);
+            @ color2 = image_node(1);
+
+            group1 -> color1 = image_edge(NodeImageAccess::COLOR_ATTACHMENT_WRITE);
+            color1 -> group2 = image_edge(NodeImageAccess::SAMPLED_IMAGE_READ);
+            group2 -> color2 = image_edge(NodeImageAccess::COLOR_ATTACHMENT_WRITE);
+        };
+
+        let expected_graph = graph! {
+            pass1 = subpass_node(1);
+            pass2 = subpass_node(1);
+
+            color1 = image_node(0);
+            @ color2 = image_node(1);
+
+            pass1 -> color1 = image_edge(NodeImageAccess::COLOR_ATTACHMENT_WRITE);
+            color1 -> pass2 = image_edge(NodeImageAccess::SAMPLED_IMAGE_READ);
+            pass2 -> color2 = image_edge(NodeImageAccess::COLOR_ATTACHMENT_WRITE);
+        };
+
+        let mut reducer = GraphReducer::new()
+            .with_reducer(LowerRenderPassReducer)
+            .with_reducer(CombineSubpassesReducer);
+        reducer.reduce_graph(&mut graph);
+
+        assert_topo_eq(&expected_graph, &graph);
+    }
+
+    #[test]
+    fn test_combine_three_passes_with_depth_read() {
+        test_init();
+
+        let mut graph = graph! {
+            group1 = group_node();
+            group2 = group_node();
+            group3 = group_node();
+
+            color_a = image_node(0);
+            color_b = image_node(0);
+            @ color_c = image_node(0);
+            depth_a = image_node(1);
+            @ depth_b = image_node(1);
+
+            group1 -> color_a = image_edge(NodeImageAccess::COLOR_ATTACHMENT_WRITE);
+            group1 -> depth_a = image_edge(NodeImageAccess::DEPTH_STENCIL_ATTACHMENT_WRITE);
+            color_a -> group2 = image_edge(NodeImageAccess::COLOR_ATTACHMENT_READ);
+            depth_a -> group2 = image_edge(NodeImageAccess::DEPTH_STENCIL_ATTACHMENT_READ);
+            group2 -> color_b = image_edge(NodeImageAccess::COLOR_ATTACHMENT_WRITE);
+            color_b -> group3 = image_edge(NodeImageAccess::COLOR_ATTACHMENT_READ);
+            depth_a -> group3 = image_edge(NodeImageAccess::DEPTH_STENCIL_ATTACHMENT_READ);
+            group3 -> color_c = image_edge(NodeImageAccess::COLOR_ATTACHMENT_WRITE);
+            group3 -> depth_b = image_edge(NodeImageAccess::DEPTH_STENCIL_ATTACHMENT_WRITE);
+        };
+
+        let expected_graph = graph! {
+            pass = subpass_node(3);
+            @ color_a = image_node(0);
+            @ depth_a = image_node(1);
+            pass -> color_a = image_edge(NodeImageAccess::COLOR_ATTACHMENT_WRITE);
+            pass -> depth_a = image_edge(NodeImageAccess::DEPTH_STENCIL_ATTACHMENT_WRITE);
+        };
+
+        let mut reducer = GraphReducer::new()
+            .with_reducer(LowerRenderPassReducer)
+            .with_reducer(CombineSubpassesReducer);
+        reducer.reduce_graph(&mut graph);
+
+        assert_topo_eq(&expected_graph, &graph);
+    }
+
+    #[test]
+    fn test_combine_three_passes_with_external_read() {
+        test_init();
+
+        let mut graph = graph! {
+            group1 = group_node();
+            group2 = group_node();
+            group3 = group_node();
+            group4 = group_node();
+
+            color_a = image_node(0);
+            color_b = image_node(0);
+            @ color_c = image_node(0);
+            depth_a = image_node(1);
+            @ depth_b = image_node(1);
+            external_a = image_node(2);
+
+            group4 -> external_a = image_edge(NodeImageAccess::COLOR_ATTACHMENT_WRITE);
+            group1 -> color_a = image_edge(NodeImageAccess::COLOR_ATTACHMENT_WRITE);
+            group1 -> depth_a = image_edge(NodeImageAccess::DEPTH_STENCIL_ATTACHMENT_WRITE);
+            color_a -> group2 = image_edge(NodeImageAccess::COLOR_ATTACHMENT_READ);
+            depth_a -> group2 = image_edge(NodeImageAccess::DEPTH_STENCIL_ATTACHMENT_READ);
+            external_a -> group2 = image_edge(NodeImageAccess::SAMPLED_IMAGE_READ);
+            group2 -> color_b = image_edge(NodeImageAccess::COLOR_ATTACHMENT_WRITE);
+            color_b -> group3 = image_edge(NodeImageAccess::COLOR_ATTACHMENT_READ);
+            depth_a -> group3 = image_edge(NodeImageAccess::DEPTH_STENCIL_ATTACHMENT_READ);
+            group3 -> color_c = image_edge(NodeImageAccess::COLOR_ATTACHMENT_WRITE);
+            group3 -> depth_b = image_edge(NodeImageAccess::DEPTH_STENCIL_ATTACHMENT_WRITE);
+        };
+
+        let expected_graph = graph! {
+            main_pass = subpass_node(3);
+            depth_a = image_node(1);
+            color_a = image_node(0);
+            ext_pass = subpass_node(1);
+            external_a = image_node(2);
+
+            @ color_a;
+            @ depth_a;
+
+            ext_pass -> external_a = image_edge(NodeImageAccess::COLOR_ATTACHMENT_WRITE);
+            main_pass -> depth_a = image_edge(NodeImageAccess::DEPTH_STENCIL_ATTACHMENT_WRITE);
+            main_pass -> color_a = image_edge(NodeImageAccess::COLOR_ATTACHMENT_WRITE);
+            external_a -> main_pass = image_edge(NodeImageAccess::SAMPLED_IMAGE_READ);
+        };
+
+        let mut reducer = GraphReducer::new()
+            .with_reducer(LowerRenderPassReducer)
+            .with_reducer(CombineSubpassesReducer);
+        reducer.reduce_graph(&mut graph);
+
+        dbg!(&graph);
+        dbg!(&expected_graph);
 
         assert_topo_eq(&expected_graph, &graph);
     }
