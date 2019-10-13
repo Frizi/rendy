@@ -1,19 +1,20 @@
 use {
     super::{
         node::{
-            DynNode, DynNodeBuilder, InternalUse, Node, NodeBuildError, NodeBuilder,
+            DynNode, DynNodeBuilder, GeneralFn, InternalUse, Node, NodeBuildError, NodeBuilder,
             NodeConstructionError, NodeExecution, NodeExecutionError, NodeId, OutputList,
             OutputStore, Parameter, PassFn,
         },
         pipeline::Pipeline,
         resources::{
-            BufferId, BufferInfo, ImageId, ImageInfo, NodeBufferAccess, NodeImageAccess,
-            NodeVirtualAccess, ResourceAccess, ResourceId, ResourceUsage, VirtualId,
+            BufferId, BufferInfo, BufferUsage, ImageId, ImageInfo, ImageUsage, NodeBufferAccess,
+            NodeImageAccess, NodeVirtualAccess, ResourceId, ResourceUsage, VirtualId,
         },
     },
     crate::{command::Families, factory::Factory},
-    daggy::{Dag, NodeIndex},
+    daggy::{Dag, EdgeIndex, NodeIndex},
     gfx_hal::Backend,
+    smallvec::{smallvec, SmallVec},
     std::{any::Any, collections::HashMap, ops::Range},
 };
 /// A builder type for rendering graph.
@@ -90,7 +91,7 @@ impl<B: Backend, T: ?Sized> Graph<B, T> {
         let mut run_ctx = RunContext::new(factory, families);
         self.nodes.run_construction_phase(&mut run_ctx, aux)?;
 
-        self.pipeline.optimize(&mut run_ctx.graph.dag);
+        self.pipeline.reduce(&mut run_ctx.graph.dag);
 
         // Graph lowering
         // All graph excution types are eventually becoming a "General" nodes
@@ -154,7 +155,8 @@ impl<B: Backend, T: ?Sized> GraphNodes<B, T> {
         run_ctx: &mut RunContext<'b, B, T>,
         aux: &T,
     ) -> Result<(), GraphRunError> {
-        let mut outputs = smallvec::SmallVec::<[_; 8]>::new();
+        // insert all nodes in their original order, except outputs that are inserted last
+        let mut outputs = SmallVec::<[_; 8]>::new();
 
         for (i, node) in self.0.iter_mut().enumerate() {
             let mut seed = run_ctx.graph.seed();
@@ -172,12 +174,12 @@ impl<B: Backend, T: ?Sized> GraphNodes<B, T> {
             if execution.is_output() {
                 outputs.push((seed, execution));
             } else {
-                run_ctx.graph.insert(seed, execution, false);
+                run_ctx.graph.insert(seed, execution);
             }
         }
 
         for (seed, execution) in outputs.drain().rev() {
-            run_ctx.graph.insert(seed, execution, true);
+            run_ctx.graph.insert(seed, execution);
         }
 
         Ok(())
@@ -209,16 +211,16 @@ impl<'a, 'b, B: Backend, T: ?Sized> NodeContext<'a, 'b, B, T> {
     }
     /// Create new image owned by graph.
     pub fn create_image(&mut self, image_info: ImageInfo) -> ImageId {
-        self.run.create_image(image_info)
+        self.run.graph.create_image(image_info)
     }
     /// Create new buffer owned by graph.
     pub fn create_buffer(&mut self, buffer_info: BufferInfo) -> BufferId {
-        self.run.create_buffer(buffer_info)
+        self.run.graph.create_buffer(buffer_info)
     }
     /// Create non-data dependency target. A virtual resource intended to
     /// describe dependencies between rendering nodes without carrying any data.
     pub fn create_virtual(&mut self) -> VirtualId {
-        self.run.create_virtual()
+        self.run.graph.create_virtual()
     }
     pub fn use_virtual(&mut self, id: VirtualId, access: NodeVirtualAccess) {
         self.run
@@ -226,85 +228,135 @@ impl<'a, 'b, B: Backend, T: ?Sized> NodeContext<'a, 'b, B, T> {
             .use_resource(self.seed, ResourceUsage::Virtual(id, access));
     }
     /// Declare usage of image by the node
-    pub fn use_image(&mut self, id: ImageId, access: NodeImageAccess) {
+    pub fn use_image(&mut self, id: ImageId, usage: ImageUsage) {
         self.run
             .graph
-            .use_resource(self.seed, ResourceUsage::Image(id, access));
+            .use_resource(self.seed, usage.resource_usage(id));
     }
     /// Declare usage of buffer by the node
-    pub fn use_buffer(&mut self, id: BufferId, access: NodeBufferAccess) {
+    pub fn use_buffer(&mut self, id: BufferId, usage: BufferUsage) {
         self.run
             .graph
-            .use_resource(self.seed, ResourceUsage::Buffer(id, access));
+            .use_resource(self.seed, usage.resource_usage(id));
     }
 }
 
-pub(crate) enum PlanNodeData<'a, B: Backend, T: ?Sized> {
+#[derive(Debug, Clone)]
+pub(crate) struct ImageNode {
+    pub(crate) kind: gfx_hal::image::Kind,
+    pub(crate) levels: gfx_hal::image::Level,
+    pub(crate) format: gfx_hal::format::Format,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BufferNode {
+    pub(crate) size: u64,
+}
+
+pub(crate) enum PlanNodeData<'n, B: Backend, T: ?Sized> {
     /// Construction phase execution
-    Execution(NodeExecution<'a, B, T>),
+    // Execution(NodeExecution<'a, B, T>),
     /// Construction phase resource
-    Resource(ResourceId),
-    // /// A resource usage that is used as an attachment read or write.
-    // Attachment(ResourceId),
-    /// A lowered subpass that might have multiple render groups.
-    RenderSubpass(Vec<PassFn<'a, B, T>>),
+    // Resource(ResourceId),
+    Image(ImageNode),
+    Buffer(BufferNode),
+    ImageVersion,
+    BufferVersion,
+    /// Image clear operation
+    ClearImage(gfx_hal::command::ClearValue),
+    /// Buffer clear operation
+    ClearBuffer(u32),
+    UndefinedImage,
+    UndefinedBuffer,
+    /// A subpass that might have multiple render groups.
+    RenderSubpass(SmallVec<[PassFn<'n, B, T>; 4]>),
+    /// A node representing arbitrary runnable operation. All Op nodes are eventually lowered into it.
+    Run(GeneralFn<'n, B, T>),
+    /// Resolve multisampled image into non-multisampled one.
+    /// Currently this works under asumption that all layers of source image are resolved into first layer of destination.
+    ResolveImage,
     /// Placeholder value required to take out the node out of graph just before replacing it
     Tombstone,
     /// Graph root node. All incoming nodes are always evaluated.
     Root,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Attachment {
+    Input {
+        index: usize,
+        ops: gfx_hal::pass::AttachmentOps,
+    },
+    DepthStencil {
+        index: usize,
+        ops: gfx_hal::pass::AttachmentOps,
+        stecil_ops: gfx_hal::pass::AttachmentOps,
+    },
+    Color {
+        index: usize,
+        ops: gfx_hal::pass::AttachmentOps,
+    },
+    // TODO: Resolve attachments should be inferred from...
+    // - using multiple samples on non-msaa targets?
+    // - using SINGLE sample on msaa targets (resolve in subpass before)
+    // - using msaa on multisampling
+    Resolve {
+        index: usize,
+        ops: gfx_hal::pass::AttachmentOps,
+    },
+    // TODO: preserve attachments should be autoinferred based on subpass joining
+    Preserve,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PlanEdge {
+    /// Target node accesses connected source image version.
+    ImageAccess(NodeImageAccess, gfx_hal::pso::PipelineStage),
+    BufferAccess(NodeBufferAccess, gfx_hal::pso::PipelineStage),
+    /// Target node uses connected source image version as an attachment.
+    Attachment(Attachment),
+    /// A node-to-node execution order dependency
+    Effect,
+    /// Resource version relation. Version increases in the edge direction
+    Version,
+    /// Link between a resource and a node that is responsible for it's creation.
+    /// TODO: can this be just an effect?
+    Origin,
+}
+
 impl<'n, B: Backend, T: ?Sized> std::fmt::Debug for PlanNodeData<'n, B, T> {
     fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self {
-            PlanNodeData::Execution(exec) => {
-                fmt.debug_struct("Execution").field("exec", exec).finish()
-            }
-            PlanNodeData::Resource(res) => fmt.debug_tuple("Resource").field(res).finish(),
-            // PlanNodeData::Attachment(res) => fmt.debug_tuple("Attachment").field(res).finish(),
-            PlanNodeData::RenderSubpass(vec) => {
-                fmt.debug_tuple("RenderSubpass").field(&vec.len()).finish()
-            }
+        match self {
+            PlanNodeData::Image(node) => fmt.debug_tuple("Image").field(node).finish(),
+            PlanNodeData::Buffer(node) => fmt.debug_tuple("Buffer").field(node).finish(),
+            PlanNodeData::ClearImage(c) => fmt.debug_tuple("ClearImage").field(c).finish(),
+            PlanNodeData::ClearBuffer(c) => fmt.debug_tuple("ClearBuffer").field(c).finish(),
+            PlanNodeData::ImageVersion => fmt.debug_tuple("ImageVersion").finish(),
+            PlanNodeData::BufferVersion => fmt.debug_tuple("BufferVersion").finish(),
+            PlanNodeData::UndefinedImage => fmt.debug_tuple("UndefinedImage").finish(),
+            PlanNodeData::UndefinedBuffer => fmt.debug_tuple("UndefinedBuffer").finish(),
+            PlanNodeData::RenderSubpass(vec) => fmt
+                .debug_tuple(&format!("RenderSubpass[{}]", vec.len()))
+                .finish(),
+            PlanNodeData::Run(_) => fmt.debug_tuple("Run").finish(),
+            PlanNodeData::ResolveImage => fmt.debug_tuple("ResolveImage").finish(),
             PlanNodeData::Tombstone => fmt.debug_tuple("Tombstone").finish(),
             PlanNodeData::Root => fmt.debug_tuple("Root").finish(),
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum PlanEdge {
-    /// generic data acccess of any type.
-    /// When directed towards resource node, it is a write access.
-    Data(ResourceAccess),
-    // edge created only as a node-to-node re
-    Effect,
-}
-
 impl PlanEdge {
-    pub(crate) fn is_data(&self) -> bool {
-        match self {
-            PlanEdge::Data(_) => true,
-            _ => false,
-        }
-    }
-
-    pub(crate) fn is_effect(&self) -> bool {
-        match self {
-            PlanEdge::Effect => true,
-            _ => false,
-        }
-    }
-
     pub(crate) fn is_attachment_only(&self) -> bool {
         match self {
-            PlanEdge::Data(usage) => usage.is_attachment_only(),
+            PlanEdge::ImageAccess(usage, _) => usage.is_attachment_only(),
             _ => false,
         }
     }
 
     pub(crate) fn is_attachment(&self) -> bool {
         match self {
-            PlanEdge::Data(usage) => usage.is_attachment(),
+            PlanEdge::ImageAccess(usage, _) => usage.is_attachment(),
             _ => false,
         }
     }
@@ -320,6 +372,11 @@ pub(crate) type PlanDag<'a, B, T> = Dag<PlanNodeData<'a, B, T>, PlanEdge>;
 #[derive(Debug)]
 pub struct PlanGraph<'a, B: Backend, T: ?Sized> {
     dag: PlanDag<'a, B, T>,
+    images: Vec<ImageInfo>,
+    buffers: Vec<BufferInfo>,
+    processed_images: usize,
+    processed_buffers: usize,
+    virtuals: usize,
     last_writes: HashMap<ResourceId, NodeIndex>,
     resource_usage: Vec<ResourceUsage>,
 }
@@ -338,6 +395,11 @@ impl<'a, B: Backend, T: ?Sized> PlanGraph<'a, B, T> {
 
         Self {
             dag,
+            images: Vec::new(),
+            buffers: Vec::new(),
+            processed_images: 0,
+            processed_buffers: 0,
+            virtuals: 0,
             last_writes: HashMap::new(),
             resource_usage: Vec::new(),
         }
@@ -362,53 +424,161 @@ impl<'a, B: Backend, T: ?Sized> PlanGraph<'a, B, T> {
         }
     }
 
-    fn insert(&mut self, seed: NodeSeed, exec: NodeExecution<'a, B, T>, root: bool) {
+    /// Create new image owned by graph.
+    pub(crate) fn create_image(&mut self, image_info: ImageInfo) -> ImageId {
+        self.images.push(image_info);
+        ImageId(self.processed_images + self.images.len() - 1)
+    }
+    /// Create new buffer owned by graph.
+    pub(crate) fn create_buffer(&mut self, buffer_info: BufferInfo) -> BufferId {
+        self.buffers.push(buffer_info);
+        BufferId(self.processed_buffers + self.buffers.len() - 1)
+    }
+    /// Create non-data dependency target. A virtual resource intended to
+    /// describe dependencies between rendering nodes without carrying any data.
+    pub(crate) fn create_virtual(&mut self) -> VirtualId {
+        self.virtuals += 1;
+        VirtualId(self.virtuals - 1)
+    }
+
+    fn add_node(&mut self, node: PlanNodeData<'a, B, T>) -> NodeIndex {
+        self.dag.add_node(node)
+    }
+
+    fn add_child(
+        &mut self,
+        parent: NodeIndex,
+        edge: PlanEdge,
+        node: PlanNodeData<'a, B, T>,
+    ) -> NodeIndex {
+        self.dag.add_child(parent, edge, node).1
+    }
+
+    fn add_edge(&mut self, from: NodeIndex, to: NodeIndex, edge: PlanEdge) -> EdgeIndex {
+        self.dag.add_edge(from, to, edge).unwrap_or_else(|err| {
+            panic!(
+                "Trying to insert a cycle by adding an edge {} -> {}: {:?}",
+                from.index(),
+                to.index(),
+                err,
+            )
+        })
+    }
+
+    fn process_resources(&mut self) {
+        for info in self.images.drain(..) {
+            let id = self.processed_images;
+            let init_data = if let Some(clear) = info.clear {
+                PlanNodeData::ClearImage(clear)
+            } else {
+                PlanNodeData::UndefinedImage
+            };
+
+            let def = self.dag.add_node(PlanNodeData::Image(ImageNode {
+                kind: info.kind,
+                levels: info.levels,
+                format: info.format,
+            }));
+            let init = self.dag.add_child(def, PlanEdge::Origin, init_data).1;
+            let version = self
+                .dag
+                .add_child(init, PlanEdge::Origin, PlanNodeData::ImageVersion)
+                .1;
+            self.last_writes
+                .insert(ResourceId::Image(ImageId(id)), version);
+            self.processed_images += 1;
+        }
+        for info in self.buffers.drain(..) {
+            let id = self.processed_buffers;
+            let init_data = if let Some(clear) = info.clear {
+                PlanNodeData::ClearBuffer(clear)
+            } else {
+                PlanNodeData::UndefinedBuffer
+            };
+
+            let def = self
+                .dag
+                .add_node(PlanNodeData::Buffer(BufferNode { size: info.size }));
+            let init = self.dag.add_child(def, PlanEdge::Origin, init_data).1;
+            let version = self
+                .dag
+                .add_child(init, PlanEdge::Origin, PlanNodeData::BufferVersion)
+                .1;
+            self.last_writes
+                .insert(ResourceId::Image(ImageId(id)), version);
+            self.processed_buffers += 1;
+        }
+    }
+
+    fn insert(&mut self, seed: NodeSeed, exec: NodeExecution<'a, B, T>) {
         // inserts should always happen in such order that resource usages are free to be drained
         debug_assert!(self.resource_usage.len() == seed.resources.end);
 
-        let resources = seed.resources;
-
-        let node_data = PlanNodeData::Execution(exec);
-
-        let n = self.dag.add_node(node_data);
-
-        let mut connect_node_root = root;
-
-        for res in self.resource_usage.drain(resources) {
-            let (id, access) = res.open();
-
-            let (reads, writes) = access.split_rw();
-
-            // insert read
-            if let Some(prev_write) = self.last_writes.get(&id) {
-                self.dag
-                    .add_edge(*prev_write, n, PlanEdge::Data(reads))
-                    .expect("Trying to insert a cycle");
-            } else {
-                // Node reads something that was never written.
-                // It is either dead or reads from previous frame state (only if the resource is not cleared).
-                // TODO: check what to do about it
+        // insert execution node
+        let node = match exec {
+            NodeExecution::RenderPass(group) => {
+                self.add_node(PlanNodeData::RenderSubpass(smallvec![group]))
             }
+            NodeExecution::General(run) => self.add_node(PlanNodeData::Run(run)),
+            NodeExecution::Output(run) => {
+                let node = self.add_node(PlanNodeData::Run(run));
+                self.add_edge(node, NodeIndex::new(0), PlanEdge::Effect);
+                node
+            }
+            NodeExecution::None => return,
+        };
 
-            // insert write
-            if !writes.is_empty() {
-                let (_, res_node) =
-                    self.dag
-                        .add_child(n, PlanEdge::Data(writes), PlanNodeData::Resource(id));
-                self.last_writes.insert(id, res_node);
-                if root {
-                    self.dag
-                        .add_edge(res_node, NodeIndex::new(0), PlanEdge::Effect)
-                        .expect("Cycle through root");
-                    connect_node_root = false;
+        // process resources created up to this point
+        self.process_resources();
+
+        // insert resource reads and writes
+        for res in self.resource_usage.drain(seed.resources) {
+            match res {
+                ResourceUsage::Image(id, access, stage) => {
+                    if !access.is_empty() {
+                        let last_version = self
+                            .last_writes
+                            .get(&ResourceId::Image(id))
+                            .copied()
+                            .expect("Accessing unproceessed image");
+                        self.dag
+                            .add_edge(last_version, node, PlanEdge::ImageAccess(access, stage))
+                            .unwrap();
+                        if !access.writes().is_empty() {
+                            self.dag
+                                .add_child(node, PlanEdge::Origin, PlanNodeData::ImageVersion);
+                            self.last_writes.insert(ResourceId::Image(id), node);
+                        }
+                    }
+                }
+                ResourceUsage::Buffer(id, access, stage) => {
+                    if !access.is_empty() {
+                        let last_version = self
+                            .last_writes
+                            .get(&ResourceId::Buffer(id))
+                            .copied()
+                            .expect("Accessing unproceessed buffer");
+                        self.dag
+                            .add_edge(last_version, node, PlanEdge::BufferAccess(access, stage))
+                            .unwrap();
+                        if !access.writes().is_empty() {
+                            self.dag
+                                .add_child(node, PlanEdge::Origin, PlanNodeData::BufferVersion);
+                            self.last_writes.insert(ResourceId::Buffer(id), node);
+                        }
+                    }
+                }
+                ResourceUsage::Virtual(id, access) => {
+                    if !access.is_empty() {
+                        if let Some(dep) = self.last_writes.get(&ResourceId::Virtual(id)) {
+                            self.dag.add_edge(node, *dep, PlanEdge::Effect).unwrap();
+                        }
+                    }
+                    if !access.writes().is_empty() {
+                        self.last_writes.insert(ResourceId::Virtual(id), node);
+                    }
                 }
             }
-        }
-
-        if connect_node_root {
-            self.dag
-                .add_edge(n, NodeIndex::new(0), PlanEdge::Effect)
-                .expect("Cycle through root");
         }
     }
 }
@@ -417,9 +587,9 @@ impl<'a, B: Backend, T: ?Sized> PlanGraph<'a, B, T> {
 pub(crate) struct RunContext<'a, B: Backend, T: ?Sized> {
     pub(crate) factory: &'a Factory<B>,
     pub(crate) families: &'a Families<B>,
-    images: Vec<ImageInfo>,
-    buffers: Vec<BufferInfo>,
-    virtuals: usize,
+    // images: Vec<ImageInfo>,
+    // buffers: Vec<BufferInfo>,
+    // virtuals: usize,
     pub(crate) output_store: OutputStore,
     graph: PlanGraph<'a, B, T>,
 }
@@ -429,28 +599,12 @@ impl<'a, B: Backend, T: ?Sized> RunContext<'a, B, T> {
         Self {
             factory,
             families,
-            images: Vec::new(),
-            buffers: Vec::new(),
-            virtuals: 0,
+            // images: Vec::new(),
+            // buffers: Vec::new(),
+            // virtuals: 0,
             output_store: OutputStore::new(),
             graph: PlanGraph::new(),
         }
-    }
-    /// Create new image owned by graph.
-    pub(crate) fn create_image(&mut self, image_info: ImageInfo) -> ImageId {
-        self.images.push(image_info);
-        ImageId(self.images.len() - 1)
-    }
-    /// Create new buffer owned by graph.
-    pub(crate) fn create_buffer(&mut self, buffer_info: BufferInfo) -> BufferId {
-        self.buffers.push(buffer_info);
-        BufferId(self.buffers.len() - 1)
-    }
-    /// Create non-data dependency target. A virtual resource intended to
-    /// describe dependencies between rendering nodes without carrying any data.
-    pub(crate) fn create_virtual(&mut self) -> VirtualId {
-        self.virtuals += 1;
-        VirtualId(self.virtuals - 1)
     }
 }
 /// Error that happen during rendering graph run.

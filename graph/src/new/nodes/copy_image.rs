@@ -12,7 +12,7 @@ use {
                 gfx_acquire_barriers, gfx_release_barriers, Node, NodeBuildError, NodeBuilder,
                 NodeConstructionError, NodeExecution, NodeImage, OutputList, Parameter,
             },
-            resources::{ImageId, NodeImageAccess},
+            resources::{ImageId, ImageUsage},
             track::Track,
         },
     },
@@ -80,8 +80,8 @@ impl<B: Backend, T: ?Sized> Node<B, T> for CopyImage<B> {
         let src_id = *ctx.get_parameter(self.src)?;
         let dst_id = *ctx.get_parameter(self.dst)?;
 
-        ctx.use_image(src_id, NodeImageAccess::TRANSFER_READ);
-        ctx.use_image(dst_id, NodeImageAccess::TRANSFER_WRITE);
+        ctx.use_image(src_id, ImageUsage::TransferRead);
+        ctx.use_image(dst_id, ImageUsage::TransferWrite);
 
         let pool = &mut self.pool;
         let submit = &mut self.submit;

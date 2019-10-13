@@ -34,11 +34,12 @@ macro_rules! graph_decl {
             graph_decl!(@decl [$graph], $($tail)*);
         };
         (@decl [$graph:ident], $a:ident -> $b:ident = $edge:expr; $($tail:tt)*) => {
-            $graph.add_edge($a, $b, $edge).unwrap_or_else(|_| {
+            $graph.add_edge($a, $b, $edge).unwrap_or_else(|err| {
                 panic!(
-                    "Failed inserting link ({} -> {})",
+                    "Failed inserting link ({} -> {}): {}",
                     stringify!($a),
-                    stringify!($b)
+                    stringify!($b),
+                    err,
                 )
             });
             graph_decl!(@decl [$graph], $($tail)*);

@@ -1,6 +1,8 @@
 // TODO: after all required nodes are implemented, disallow dead code and remove what's left
 #![allow(dead_code)]
 
+//! A new implementation of rendering graph
+
 #[cfg(test)]
 #[macro_use]
 mod test;

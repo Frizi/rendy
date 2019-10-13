@@ -57,7 +57,7 @@ struct ReductionState {
     stack: Vec<NodeProgress>,
     revisit: Vec<NodeIndex>,
     node_flags: Vec<State>,
-    temp_parents: Vec<NodeIndex>,
+    scratch_ids: Vec<NodeIndex>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -277,14 +277,14 @@ impl ReductionState {
         graph: &mut PlanDag<'a, B, T>,
         reset: bool,
     ) -> bool {
-        debug_assert!(self.temp_parents.is_empty());
+        debug_assert!(self.scratch_ids.is_empty());
         let NodeProgress { node, input_index } = self.stack.last().copied().unwrap();
 
         // move vec out to avoid self borrow
-        let mut parents = std::mem::replace(&mut self.temp_parents, Vec::new());
+        let mut parents = std::mem::replace(&mut self.scratch_ids, Vec::new());
         parents.extend(graph.parents(node).iter(graph).map(|(_, n)| n));
 
-        let offset = if !reset && self.temp_parents.len() < input_index as usize {
+        let offset = if !reset && self.scratch_ids.len() < input_index as usize {
             input_index as usize
         } else {
             0
@@ -294,7 +294,7 @@ impl ReductionState {
             if input != node && self.recurse(input) {
                 self.stack.last_mut().unwrap().input_index = (i + offset + 1) as u32;
                 parents.clear();
-                std::mem::replace(&mut self.temp_parents, parents);
+                std::mem::replace(&mut self.scratch_ids, parents);
                 return true;
             }
         }
@@ -303,13 +303,13 @@ impl ReductionState {
             if input != node && self.recurse(input) {
                 self.stack.last_mut().unwrap().input_index = i as u32 + 1;
                 parents.clear();
-                std::mem::replace(&mut self.temp_parents, parents);
+                std::mem::replace(&mut self.scratch_ids, parents);
                 return true;
             }
         }
 
         parents.clear();
-        std::mem::replace(&mut self.temp_parents, parents);
+        std::mem::replace(&mut self.scratch_ids, parents);
         return false;
     }
 
@@ -410,7 +410,7 @@ impl<B: Backend, T: ?Sized> GraphReducer<B, T> {
                 stack: Vec::new(),
                 revisit: Vec::new(),
                 node_flags: Vec::new(),
-                temp_parents: Vec::new(),
+                scratch_ids: Vec::new(),
             },
         }
     }
