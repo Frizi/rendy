@@ -1,6 +1,6 @@
 use super::graph::PlanDag;
-use daggy::{NodeIndex, Walker};
 use gfx_hal::Backend;
+use graphy::{Direction, NodeIndex, Walker};
 
 #[derive(Debug)]
 pub enum Reduction {
@@ -57,7 +57,6 @@ struct ReductionState {
     stack: Vec<NodeProgress>,
     revisit: Vec<NodeIndex>,
     node_flags: Vec<State>,
-    scratch_ids: Vec<NodeIndex>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,36 +130,32 @@ impl ReductionState {
         max_id: NodeIndex,
     ) {
         if replacement <= max_id {
-            // {replacement} is an old node, so unlink {node} and assume that
-            // {replacement} was already reduced and finish.
-            let mut children = graph.children(node);
-            while let Some((edge, user)) = children.walk_next(&graph) {
-                if let Some(e) = graph.remove_edge(edge) {
-                    graph.add_edge(replacement, user, e).unwrap();
-                }
+            // `replacement` is an old node, so unlink `node` and assume that
+            // `replacement` was already reduced and finish.
+            for (_, user) in node.children().iter(&graph) {
                 // Don't revisit this node if it refers to itself.
                 if user != node {
                     self.revisit(user);
                 }
             }
+            graph.rewire_children(node, replacement).unwrap();
             self.kill(node);
         } else {
-            // Replace all old uses of {node} with {replacement}, but allow new nodes
-            // created by this reduction to use {node}.
-            let mut children = graph.children(node);
-            while let Some((edge, user)) = children.walk_next(&graph) {
-                if user <= max_id {
-                    if let Some(e) = graph.remove_edge(edge) {
-                        graph.add_edge(replacement, user, e).unwrap();
-                    }
-                    // Don't revisit this node if it refers to itself.
-                    if user != node {
-                        self.revisit(user);
-                    }
+            // Replace all old uses of `node` with `replacement`, but allow new nodes
+            // created by this reduction to use `node`.
+            for (_, user) in node.children().iter(&graph) {
+                // Don't revisit this node if it refers to itself.
+                if user <= max_id && user != node {
+                    self.revisit(user);
                 }
             }
-            // Unlink {node} if it's no longer used.
-            if graph.children(node).walk_next(&graph).is_none() {
+            graph
+                .rewire_where(Direction::Outgoing, node, replacement, |_, user| {
+                    user <= max_id
+                })
+                .unwrap();
+            // Unlink `node` if it's no longer used.
+            if node.children().walk_next(&graph).is_none() {
                 self.kill(node);
             }
 
@@ -263,7 +258,7 @@ impl ReductionState {
         // remove dead nodes
         for (id, state) in self.node_flags.drain(..).enumerate().rev() {
             if state == State::Dead {
-                graph.remove_node(NodeIndex::new(id));
+                graph.remove_node(NodeIndex::new(id as _));
             }
         }
 
@@ -277,39 +272,30 @@ impl ReductionState {
         graph: &mut PlanDag<'a, B, T>,
         reset: bool,
     ) -> bool {
-        debug_assert!(self.scratch_ids.is_empty());
         let NodeProgress { node, input_index } = self.stack.last().copied().unwrap();
 
-        // move vec out to avoid self borrow
-        let mut parents = std::mem::replace(&mut self.scratch_ids, Vec::new());
-        parents.extend(graph.parents(node).iter(graph).map(|(_, n)| n));
-
-        let offset = if !reset && self.scratch_ids.len() < input_index as usize {
+        let offset = if !reset && node.parents().iter(&graph).len() < input_index as usize {
             input_index as usize
         } else {
             0
         };
 
-        for (i, input) in parents.iter().rev().skip(offset).copied().enumerate() {
+        let parents_after = node.parents().iter(&graph).skip(offset);
+        for (i, (_, input)) in parents_after.enumerate() {
             if input != node && self.recurse(input) {
                 self.stack.last_mut().unwrap().input_index = (i + offset + 1) as u32;
-                parents.clear();
-                std::mem::replace(&mut self.scratch_ids, parents);
                 return true;
             }
         }
 
-        for (i, input) in parents.iter().rev().take(offset).copied().enumerate() {
+        let parents_upto = node.parents().iter(&graph).take(offset);
+        for (i, (_, input)) in parents_upto.enumerate() {
             if input != node && self.recurse(input) {
                 self.stack.last_mut().unwrap().input_index = i as u32 + 1;
-                parents.clear();
-                std::mem::replace(&mut self.scratch_ids, parents);
                 return true;
             }
         }
 
-        parents.clear();
-        std::mem::replace(&mut self.scratch_ids, parents);
         return false;
     }
 
@@ -324,11 +310,7 @@ impl ReductionState {
             return self.pop(); // Node was killed while on stack.
         }
 
-        log::trace!(
-            "Reduce top [{}]: {:?}",
-            node.index(),
-            graph.node_weight(node)
-        );
+        log::trace!("Reduce top [{}]: {:?}", node.index(), graph.get_node(node));
 
         debug_assert_eq!(State::OnStack, self.state(node));
 
@@ -354,7 +336,7 @@ impl ReductionState {
                 self.pop();
 
                 // Revisit all uses of the node.
-                for (_, user) in graph.children(node).iter(graph) {
+                for (_, user) in node.children().iter(graph) {
                     // Don't revisit this node if it refers to itself.
                     // TODO: impossible because Dag, do we want to keep it like that?
                     if user != node {
@@ -410,7 +392,6 @@ impl<B: Backend, T: ?Sized> GraphReducer<B, T> {
                 stack: Vec::new(),
                 revisit: Vec::new(),
                 node_flags: Vec::new(),
-                scratch_ids: Vec::new(),
             },
         }
     }

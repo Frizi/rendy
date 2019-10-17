@@ -38,8 +38,10 @@ relevant = { version = "0.4", features = ["log"] }
 serde = { version = "1.0", optional = true, features = ["derive"] }
 smallvec = "1.0"
 thread_profiler = "0.3"
-daggy = "0.6.0"
-petgraph = "0.4"
+fixedbitset = "0.2"
+graphy = { path="../../graphy" }
+# graphy = { git = "https://github.com/jaynus/graphy/", branch = "master" }
 
 [dev-dependencies]
 env_logger = "0.6"
+dot = "0.1"

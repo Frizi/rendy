@@ -2,10 +2,9 @@ use {
     crate::new::{
         graph::{PlanDag, PlanEdge, PlanNodeData},
         graph_reducer::{GraphEditor, Reducer, Reduction},
-        walker::WalkerExt,
     },
-    daggy::{EdgeIndex, NodeIndex, Walker},
     gfx_hal::Backend,
+    graphy::{Direction, EdgeIndex, NodeIndex, Walker},
 };
 
 // Find render pass nodes that writes only exclusive attachments
@@ -16,103 +15,84 @@ impl<'a, B: Backend, T: ?Sized> Reducer<B, T> for CombineSubpassesReducer {
     fn reduce(&mut self, editor: &mut GraphEditor<B, T>, node: NodeIndex) -> Reduction {
         let mut candidate_merge = None;
 
-        match editor.graph().node_weight(node) {
-            Some(PlanNodeData::RenderSubpass(_)) => {
-                let mut read_attachments = walk_attachments(editor.graph().parents(node));
+        if let Some(PlanNodeData::RenderSubpass(_)) = editor.graph().get_node(node) {
+            let mut read_attachments = walk_attachments(node.parents());
 
-                // Do all attachments I read come from the same node? If so, which node?
-                while let Some((_, access_node)) = read_attachments.walk_next(editor.graph()) {
-                    // take attachment writer
-                    let (_, writer) = walk_origins(editor.graph().parents(access_node))
-                        .walk_next(editor.graph())
-                        .expect("Attachment node must have an orign");
+            // Do all attachments I read come from the same node? If so, which node?
+            while let Some((_, access_node)) = read_attachments.walk_next(editor.graph()) {
+                // take attachment writer
+                let (_, writer) = walk_origins(access_node.parents())
+                    .walk_next(editor.graph())
+                    .expect("Attachment node must have an orign");
 
-                    match candidate_merge {
-                        Some(candidate) if candidate != writer => {
-                            // this subpass attachments are written by more than one subpass
-                            log::trace!("CombineSubpassesReducer bailout: found another writer");
-                            return Reduction::NoChange;
-                        }
-                        None => {
-                            match editor.graph().node_weight(writer) {
-                                Some(PlanNodeData::RenderSubpass(_)) => {
-                                    candidate_merge = Some(writer)
-                                }
-                                _ => {
-                                    log::trace!(
-                                        "CombineSubpassesReducer bailout: written by non-subpass"
-                                    );
-                                    // Written by not a subpass
-                                    return Reduction::NoChange;
-                                }
+                match candidate_merge {
+                    Some(candidate) if candidate != writer => {
+                        // this subpass attachments are written by more than one subpass
+                        log::trace!("CombineSubpassesReducer bailout: found another writer");
+                        return Reduction::NoChange;
+                    }
+                    None => {
+                        match editor.graph().get_node(writer) {
+                            Some(PlanNodeData::RenderSubpass(_)) => candidate_merge = Some(writer),
+                            _ => {
+                                log::trace!(
+                                    "CombineSubpassesReducer bailout: written by non-subpass"
+                                );
+                                // Written by not a subpass
+                                return Reduction::NoChange;
                             }
                         }
-                        _ => {}
                     }
+                    _ => {}
                 }
             }
-            _ => return Reduction::NoChange,
-        };
+        } else {
+            return Reduction::NoChange;
+        }
 
-        match candidate_merge {
-            Some(merge_target) => {
-                // append this pass data to other pass and replace current node with it,
-                let this_node = std::mem::replace(
-                    editor.graph_mut().node_weight_mut(node).unwrap(),
-                    PlanNodeData::Tombstone,
-                );
+        if let Some(merge_target) = candidate_merge {
+            editor
+                .graph_mut()
+                .rewire_where(Direction::Incoming, node, merge_target, |edge, _| {
+                    // TODO: actually rewire attachments that don't exist yet.
+                    // This is now not required only because we merge only exact matches.
+                    !edge.is_attachment()
+                })
+                .unwrap();
 
-                let mut reads = editor.graph().parents(node);
-                while let Some((read_edge, read_node)) = reads.walk_next(editor.graph()) {
-                    if editor
-                        .graph()
-                        .edge_weight(read_edge)
-                        .unwrap()
-                        .is_attachment()
-                    {
-                        editor.kill(read_node);
-                    } else if let Some(edge_data) = editor.graph_mut().remove_edge(read_edge) {
-                        editor
-                            .graph_mut()
-                            .add_edge(read_node, merge_target, edge_data)
-                            .unwrap();
-                    }
-                }
-
-                let merge_node = editor.graph_mut().node_weight_mut(merge_target).unwrap();
-                match (this_node, merge_node) {
-                    (
-                        PlanNodeData::RenderSubpass(ref mut this_groups),
-                        PlanNodeData::RenderSubpass(ref mut merge_groups),
-                    ) => {
-                        merge_groups.extend(this_groups.drain());
-                    }
-                    _ => unreachable!(),
-                }
-
-                Reduction::Replace(merge_target)
+            if let Ok((
+                PlanNodeData::RenderSubpass(ref mut this_groups),
+                PlanNodeData::RenderSubpass(ref mut merge_groups),
+            )) = editor.graph_mut().node_pair_mut(node, merge_target)
+            {
+                merge_groups.extend(this_groups.drain());
+            } else {
+                unreachable!();
             }
-            _ => Reduction::NoChange,
+
+            Reduction::Replace(merge_target)
+        } else {
+            Reduction::NoChange
         }
     }
 }
 
-fn walk_origins<'w, 'a: 'w, B: Backend, T: ?Sized + 'w>(
+fn walk_origins<'w, 'a: 'w, B: Backend, T: ?Sized + 'a>(
     walker: impl Walker<&'w PlanDag<'a, B, T>, Item = (EdgeIndex, NodeIndex)>,
 ) -> impl Walker<&'w PlanDag<'a, B, T>, Item = (EdgeIndex, NodeIndex)> {
     walker.filter(|graph, &(edge, _)| {
-        graph.edge_weight(edge).map_or(false, |e| match e {
+        graph.get_edge(edge).map_or(false, |e| match e {
             PlanEdge::Origin => true,
             _ => false,
         })
     })
 }
 
-fn walk_attachments<'w, 'a: 'w, B: Backend, T: ?Sized + 'w>(
+fn walk_attachments<'w, 'a: 'w, B: Backend, T: ?Sized + 'a>(
     walker: impl Walker<&'w PlanDag<'a, B, T>, Item = (EdgeIndex, NodeIndex)>,
 ) -> impl Walker<&'w PlanDag<'a, B, T>, Item = (EdgeIndex, NodeIndex)> {
     walker.filter(|graph, &(edge, _)| {
-        graph.edge_weight(edge).map_or(false, |e| match e {
+        graph.get_edge(edge).map_or(false, |e| match e {
             PlanEdge::ImageAccess(access, _) => access.is_attachment(),
             _ => false,
         })
@@ -135,12 +115,12 @@ mod test {
         graph_reducer::GraphReducer,
         node::PassFn,
         resources::{ImageUsage, ShaderUsage},
-        test::{assert_topo_eq, test_init, TestBackend},
+        test::{assert_equivalent, assert_topo_eq, test_init, visualize_graph, TestBackend},
     };
     use smallvec::SmallVec;
 
-    fn subpass_node(num_groups: usize) -> PlanNodeData<'static, TestBackend, ()> {
-        let mut vec: SmallVec<[PassFn<'static, TestBackend, ()>; 4]> =
+    fn subpass_node<'a>(num_groups: usize) -> PlanNodeData<'a, TestBackend, ()> {
+        let mut vec: SmallVec<[PassFn<'a, TestBackend, ()>; 4]> =
             SmallVec::with_capacity(num_groups);
         for _ in 0..num_groups {
             vec.push(Box::new(|_, _| Ok(())))
@@ -148,7 +128,7 @@ mod test {
         PlanNodeData::RenderSubpass(vec)
     }
 
-    fn group_node() -> PlanNodeData<'static, TestBackend, ()> {
+    fn group_node<'a>() -> PlanNodeData<'a, TestBackend, ()> {
         subpass_node(1)
     }
 
@@ -156,7 +136,7 @@ mod test {
         PlanEdge::ImageAccess(usage.access(), usage.stage())
     }
 
-    fn color_node() -> PlanNodeData<'static, TestBackend, ()> {
+    fn color_node<'a>() -> PlanNodeData<'a, TestBackend, ()> {
         PlanNodeData::Image(ImageNode {
             kind: gfx_hal::image::Kind::D2(1024, 1024, 1, 1),
             levels: 1,
@@ -164,7 +144,7 @@ mod test {
         })
     }
 
-    fn depth_node() -> PlanNodeData<'static, TestBackend, ()> {
+    fn depth_node<'a>() -> PlanNodeData<'a, TestBackend, ()> {
         PlanNodeData::Image(ImageNode {
             kind: gfx_hal::image::Kind::D2(1024, 1024, 1, 1),
             levels: 1,
@@ -175,8 +155,10 @@ mod test {
     #[test]
     fn test_combine_two_passes() {
         test_init();
+        let alloc = graphy::GraphAllocator::default();
 
         let mut graph = graph! {
+            [&alloc],
             group1 = group_node();
             @ group2 = group_node();
 
@@ -197,31 +179,43 @@ mod test {
         };
 
         let expected_graph = graph! {
+            [&alloc],
             @ pass = subpass_node(2);
 
             color_def = color_node();
             color_init = PlanNodeData::UndefinedImage;
             color_a = PlanNodeData::ImageVersion;
-            color_b = PlanNodeData::ImageVersion;
 
             color_def -> color_init = PlanEdge::Origin;
             color_init -> color_a = PlanEdge::Origin;
-
-            pass -> color_a = image_edge(ImageUsage::ColorAttachmentWrite);
-            pass -> color_b = PlanEdge::Origin;
+            color_a -> pass = image_edge(ImageUsage::ColorAttachmentWrite);
         };
 
         let mut reducer = GraphReducer::new().with_reducer(CombineSubpassesReducer);
         reducer.reduce_graph(&mut graph);
+        graph.trim(NodeIndex::new(0)).unwrap();
 
-        assert_topo_eq(&expected_graph, &graph);
+        assert_topo_eq(
+            &graph,
+            &[
+                PlanNodeData::Root,
+                subpass_node(2),
+                PlanNodeData::ImageVersion,
+                PlanNodeData::UndefinedImage,
+                color_node(),
+            ],
+        );
+
+        assert_equivalent(&expected_graph, &graph);
     }
 
     #[test]
     fn test_combine_two_passes_texture_access() {
         test_init();
+        let alloc = graphy::GraphAllocator::default();
 
         let mut graph = graph! {
+            [&alloc],
             group1 = group_node();
             @ group2 = group_node();
 
@@ -248,7 +242,8 @@ mod test {
             group2 -> color2_b = PlanEdge::Origin;
         };
 
-        let expected_graph = graph! {
+        let mut expected_graph = graph! {
+            [&alloc],
             group1 = subpass_node(1);
             @ group2 = subpass_node(1);
 
@@ -277,15 +272,19 @@ mod test {
 
         let mut reducer = GraphReducer::new().with_reducer(CombineSubpassesReducer);
         reducer.reduce_graph(&mut graph);
+        graph.trim(NodeIndex::new(0)).unwrap();
+        expected_graph.trim(NodeIndex::new(0)).unwrap();
 
-        assert_topo_eq(&expected_graph, &graph);
+        assert_equivalent(&expected_graph, &graph);
     }
 
     #[test]
     fn test_combine_three_passes_with_depth_read() {
         test_init();
+        let alloc = graphy::GraphAllocator::default();
 
         let mut graph = graph! {
+            [&alloc],
             group1 = group_node();
             group2 = group_node();
             @ group3 = group_node();
@@ -322,6 +321,7 @@ mod test {
         };
 
         let expected_graph = graph! {
+            [&alloc],
             @ pass = subpass_node(3);
 
             depth_a = PlanNodeData::ImageVersion;
@@ -335,65 +335,121 @@ mod test {
             color_init -> color_a = PlanEdge::Origin;
             depth_def -> depth_init = PlanEdge::Origin;
             depth_init -> depth_a = PlanEdge::Origin;
-            depth_a -> pass = image_edge(ImageUsage::DepthStencilAttachmentWrite);
             color_a -> pass = image_edge(ImageUsage::ColorAttachmentWrite);
+            depth_a -> pass = image_edge(ImageUsage::DepthStencilAttachmentWrite);
         };
 
         let mut reducer = GraphReducer::new().with_reducer(CombineSubpassesReducer);
         reducer.reduce_graph(&mut graph);
+        graph.trim(NodeIndex::new(0)).unwrap();
 
-        dbg!(&graph);
-        dbg!(&expected_graph);
-
-        assert_topo_eq(&expected_graph, &graph);
+        assert_equivalent(&expected_graph, &graph);
     }
 
     #[test]
     fn test_combine_three_passes_with_external_read() {
         test_init();
+        let alloc = graphy::GraphAllocator::default();
 
         let mut graph = graph! {
+            [&alloc],
             group1 = group_node();
             group2 = group_node();
-            group3 = group_node();
-            @ group4 = group_node();
+            @ group3 = group_node();
+            group4 = group_node();
+
+            depth_def = depth_node();
+            color_def = color_node();
+            extra_def = color_node();
+
+            color_init = PlanNodeData::UndefinedImage;
+            depth_init = PlanNodeData::UndefinedImage;
+            extra_init = PlanNodeData::UndefinedImage;
 
             color_a = PlanNodeData::ImageVersion;
             color_b = PlanNodeData::ImageVersion;
             color_c = PlanNodeData::ImageVersion;
+            color_d = PlanNodeData::ImageVersion;
             depth_a = PlanNodeData::ImageVersion;
             depth_b = PlanNodeData::ImageVersion;
-            external_a = PlanNodeData::ImageVersion;
+            depth_c = PlanNodeData::ImageVersion;
+            extra_a = PlanNodeData::ImageVersion;
+            extra_b = PlanNodeData::ImageVersion;
 
-            group4 -> external_a = image_edge(ImageUsage::ColorAttachmentWrite);
-            group1 -> color_a = image_edge(ImageUsage::ColorAttachmentWrite);
-            group1 -> depth_a = image_edge(ImageUsage::DepthStencilAttachmentWrite);
-            color_a -> group2 = image_edge(ImageUsage::ColorAttachmentRead);
-            depth_a -> group2 = image_edge(ImageUsage::DepthStencilAttachmentRead);
-            external_a -> group2 = image_edge(ImageUsage::Sampled(ShaderUsage::FRAGMENT));
-            group2 -> color_b = image_edge(ImageUsage::ColorAttachmentWrite);
-            color_b -> group3 = image_edge(ImageUsage::ColorAttachmentRead);
-            depth_a -> group3 = image_edge(ImageUsage::DepthStencilAttachmentRead);
+            color_def -> color_init = PlanEdge::Origin;
+            color_init -> color_a = PlanEdge::Origin;
+            depth_def -> depth_init = PlanEdge::Origin;
+            depth_init -> depth_a = PlanEdge::Origin;
+            extra_def -> extra_init = PlanEdge::Origin;
+            extra_init -> extra_a = PlanEdge::Origin;
+            color_a -> color_b = PlanEdge::Version;
+            color_b -> color_c = PlanEdge::Version;
+            color_c -> color_d = PlanEdge::Version;
+            depth_a -> depth_b = PlanEdge::Version;
+            depth_b -> depth_c = PlanEdge::Version;
+            extra_a -> extra_b = PlanEdge::Version;
+
+            color_a -> group1 = image_edge(ImageUsage::ColorAttachmentWrite);
+            depth_a -> group1 = image_edge(ImageUsage::DepthStencilAttachmentWrite);
+            group1 -> color_b = PlanEdge::Origin;
+            group1 -> depth_b = PlanEdge::Origin;
+
+            extra_a -> group4 = image_edge(ImageUsage::ColorAttachmentWrite);
+            group4 -> extra_b = PlanEdge::Origin;
+
+            color_b -> group2 = image_edge(ImageUsage::ColorAttachmentWrite);
+            depth_b -> group2 = image_edge(ImageUsage::DepthStencilAttachmentRead);
+            extra_b -> group2 = image_edge(ImageUsage::Sampled(ShaderUsage::FRAGMENT));
+            group2 -> color_c = PlanEdge::Origin;
+
+            color_c -> group3 = image_edge(ImageUsage::ColorAttachmentRead);
+            depth_b -> group3 = image_edge(ImageUsage::DepthStencilAttachmentRead);
             group3 -> color_c = image_edge(ImageUsage::ColorAttachmentWrite);
             group3 -> depth_b = image_edge(ImageUsage::DepthStencilAttachmentWrite);
         };
 
         let expected_graph = graph! {
-            main_pass = subpass_node(3);
+            [&alloc],
+            @ main_pass = subpass_node(3);
+            ext_pass = subpass_node(1);
+
+            depth_def = depth_node();
+            color_def = color_node();
+            extra_def = color_node();
+
+            color_init = PlanNodeData::UndefinedImage;
+            depth_init = PlanNodeData::UndefinedImage;
+            extra_init = PlanNodeData::UndefinedImage;
+
             color_a = PlanNodeData::ImageVersion;
             depth_a = PlanNodeData::ImageVersion;
-            ext_pass = subpass_node(1);
-            external_a = PlanNodeData::ImageVersion;
+            extra_a = PlanNodeData::ImageVersion;
+            extra_b = PlanNodeData::ImageVersion;
 
-            ext_pass -> external_a = image_edge(ImageUsage::ColorAttachmentWrite);
-            main_pass -> color_a = image_edge(ImageUsage::ColorAttachmentWrite);
-            main_pass -> depth_a = image_edge(ImageUsage::DepthStencilAttachmentWrite);
-            external_a -> main_pass = image_edge(ImageUsage::Sampled(ShaderUsage::FRAGMENT));
+            color_def -> color_init = PlanEdge::Origin;
+            color_init -> color_a = PlanEdge::Origin;
+            depth_def -> depth_init = PlanEdge::Origin;
+            depth_init -> depth_a = PlanEdge::Origin;
+            extra_def -> extra_init = PlanEdge::Origin;
+            extra_init -> extra_a = PlanEdge::Origin;
+            extra_a -> extra_b = PlanEdge::Version;
+
+            extra_a -> ext_pass = image_edge(ImageUsage::ColorAttachmentWrite);
+            ext_pass -> extra_b = PlanEdge::Origin;
+            color_a -> main_pass = image_edge(ImageUsage::ColorAttachmentWrite);
+            depth_a -> main_pass = image_edge(ImageUsage::DepthStencilAttachmentWrite);
+            extra_b -> main_pass = image_edge(ImageUsage::Sampled(ShaderUsage::FRAGMENT));
         };
 
+        let mut file = std::fs::File::create("graph.dot").unwrap();
+        visualize_graph(&mut file, &graph, "original");
         let mut reducer = GraphReducer::new().with_reducer(CombineSubpassesReducer);
         reducer.reduce_graph(&mut graph);
 
-        assert_topo_eq(&expected_graph, &graph);
+        visualize_graph(&mut file, &graph, "transformed");
+        graph.trim(NodeIndex::new(0)).unwrap();
+        visualize_graph(&mut file, &graph, "trimmed");
+
+        assert_equivalent(&expected_graph, &graph);
     }
 }

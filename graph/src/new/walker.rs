@@ -1,143 +1,136 @@
-use daggy::Walker;
-use petgraph::visit::{IntoNeighbors, IntoNeighborsDirected, Reversed, VisitMap, Visitable};
-use std::marker::PhantomData;
-pub(crate) trait WalkerExt<G>: Walker<G> {
-    fn filter<P>(self, predicate: P) -> Filter<G, Self, P>
-    where
-        Self: Sized,
-        P: FnMut(G, &Self::Item) -> bool,
-    {
-        Filter {
-            walker: self,
-            predicate,
-            _marker: PhantomData,
-        }
-    }
+use fixedbitset::FixedBitSet;
+use graphy::{EdgeIndex, Graph, NodeIndex, Walker};
 
-    fn filter_map<T, P>(self, predicate: P) -> FilterMap<G, Self, P>
-    where
-        Self: Sized,
-        P: FnMut(G, &Self::Item) -> Option<T>,
-    {
-        FilterMap {
-            walker: self,
-            predicate,
-            _marker: PhantomData,
-        }
-    }
+/// A reverse topological order traversal for a graph, starting from a known root node.
+pub struct Topo {
+    tovisit: Vec<NodeIndex>,
+    ordered: FixedBitSet,
 }
 
-impl<G, W> WalkerExt<G> for W where W: Walker<G> {}
-
-#[derive(Clone, Debug)]
-pub struct FilterMap<G, W, P> {
-    walker: W,
-    predicate: P,
-    _marker: PhantomData<G>,
-}
-
-impl<G, W, I, P> Walker<G> for FilterMap<G, W, P>
-where
-    G: Copy,
-    W: Walker<G>,
-    P: FnMut(G, &W::Item) -> Option<I>,
-{
-    type Item = I;
-    #[inline]
-    fn walk_next(&mut self, graph: G) -> Option<Self::Item> {
-        while let Some(item) = self.walker.walk_next(graph) {
-            if let Some(mapped) = (self.predicate)(graph, &item) {
-                return Some(mapped);
-            }
-        }
-        None
-    }
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct Filter<G, W, P> {
-    walker: W,
-    predicate: P,
-    _marker: PhantomData<G>,
-}
-
-impl<G, W, P> Walker<G> for Filter<G, W, P>
-where
-    G: Copy,
-    W: Walker<G>,
-    P: FnMut(G, &W::Item) -> bool,
-{
-    type Item = W::Item;
-    #[inline]
-    fn walk_next(&mut self, graph: G) -> Option<Self::Item> {
-        while let Some(item) = self.walker.walk_next(graph) {
-            if (self.predicate)(graph, &item) {
-                return Some(item);
-            }
-        }
-        None
-    }
-}
-/// A reverse topological order traversal for a graph, starting from a known root note.
-pub struct Topo<N, VM> {
-    tovisit: Vec<N>,
-    ordered: VM,
-}
-
-impl<N, VM> Topo<N, VM>
-where
-    N: Copy + PartialEq,
-    VM: VisitMap<N>,
-{
+impl Topo {
     /// Create a new `Topo`, using the graph's visitor map, and put all
     /// initial nodes in the to visit list.
-    pub fn new<G>(graph: G, root: N) -> Self
-    where
-        G: Visitable<NodeId = N, Map = VM>,
-    {
+    pub fn new<N, E>(graph: &Graph<N, E>, root: NodeIndex) -> Self {
         Topo {
-            ordered: graph.visit_map(),
+            ordered: FixedBitSet::with_capacity(graph.node_count() as _),
             tovisit: vec![root],
         }
     }
 
     /// Reset topological sort starting from passed root node.
-    pub fn reset(&mut self, root: N) {
+    pub fn reset(&mut self, root: NodeIndex) {
         self.tovisit.clear();
         self.tovisit.push(root);
     }
 
     /// Return the next node in the current reverse topological order traversal, or
     /// `None` if the traversal is at the end.
-    pub fn next<G>(&mut self, g: G) -> Option<N>
-    where
-        G: IntoNeighborsDirected + Visitable<NodeId = N, Map = VM>,
-    {
+    pub fn next<N, E>(&mut self, g: &Graph<N, E>) -> Option<NodeIndex> {
         // Take an unvisited element and find which of its neighbors are next
-        while let Some(nix) = self.tovisit.pop() {
-            if self.ordered.is_visited(&nix) {
+        while let Some(node) = self.tovisit.pop() {
+            if self.ordered.contains(node.index()) {
                 continue;
             }
-            self.ordered.visit(nix);
-            for neigh in Reversed(g).neighbors(nix) {
+            self.ordered.put(node.index());
+            for (_, neigh) in node.parents().iter(g) {
                 // Look at each neighbor, and those that only have incoming edges
                 // from the already ordered list, they are the next to visit.
-                if g.neighbors(neigh).all(|b| self.ordered.is_visited(&b)) {
+                if neigh
+                    .children()
+                    .iter(g)
+                    .all(|(_, b)| self.ordered.contains(b.index()))
+                {
                     self.tovisit.push(neigh);
                 }
             }
-            return Some(nix);
+            return Some(node);
         }
         None
     }
 }
 
-impl<G> Walker<G> for Topo<G::NodeId, G::Map>
-where
-    G: IntoNeighborsDirected + Visitable,
-{
-    type Item = G::NodeId;
-    fn walk_next(&mut self, context: G) -> Option<Self::Item> {
+impl<'a, N, E> Walker<&Graph<'a, N, E>> for Topo {
+    type Item = NodeIndex;
+    fn walk_next(&mut self, context: &Graph<'a, N, E>) -> Option<Self::Item> {
+        self.next(context)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum GraphItem {
+    Edge(EdgeIndex),
+    Node(NodeIndex),
+}
+
+/// A reverse topological order traversal for a graph, starting from a known root node.
+/// Also traverses edges.
+pub struct TopoWithEdges {
+    tovisit: Vec<GraphItem>,
+    ordered_nodes: FixedBitSet,
+    ordered_edges: FixedBitSet,
+}
+
+impl TopoWithEdges {
+    /// Create a new `Topo`, using the graph's visitor map, and put all
+    /// initial nodes in the to visit list.
+    pub fn new<N, E>(graph: &Graph<N, E>, root: NodeIndex) -> Self {
+        TopoWithEdges {
+            tovisit: vec![GraphItem::Node(root)],
+            ordered_nodes: FixedBitSet::with_capacity(graph.node_count() as _),
+            ordered_edges: FixedBitSet::with_capacity(graph.edge_count() as _),
+        }
+    }
+
+    /// Reset topological sort starting from passed root node.
+    pub fn reset(&mut self, root: NodeIndex) {
+        self.tovisit.clear();
+        self.tovisit.push(GraphItem::Node(root));
+    }
+
+    /// Return the next node in the current reverse topological order traversal, or
+    /// `None` if the traversal is at the end.
+    pub fn next<N, E>(&mut self, g: &Graph<N, E>) -> Option<GraphItem> {
+        // Take an unvisited element and find which of its neighbors are next
+        while let Some(item) = self.tovisit.pop() {
+            match item {
+                GraphItem::Node(node) => {
+                    if self.ordered_nodes.contains(node.index()) {
+                        continue;
+                    }
+                    self.ordered_nodes.put(node.index());
+                    // this node just got visited, visit all incoming edges next
+                    self.tovisit.extend(
+                        node.parents()
+                            .iter(g)
+                            .map(|(edge, _)| GraphItem::Edge(edge)),
+                    );
+                }
+                GraphItem::Edge(edge) => {
+                    if self.ordered_edges.contains(edge.index()) {
+                        continue;
+                    }
+                    self.ordered_edges.put(edge.index());
+
+                    // this node just got visited, visit it's origin if all it's outgoing edges were already visited
+                    let origin = g.get_edge_endpoints(edge).unwrap().from;
+                    if origin
+                        .children()
+                        .iter(g)
+                        .all(|(edge, _)| self.ordered_edges.contains(edge.index()))
+                    {
+                        self.tovisit.push(GraphItem::Node(origin));
+                    }
+                }
+            }
+            return Some(item);
+        }
+        None
+    }
+}
+
+impl<'a, N, E> Walker<&Graph<'a, N, E>> for TopoWithEdges {
+    type Item = GraphItem;
+    fn walk_next(&mut self, context: &Graph<'a, N, E>) -> Option<Self::Item> {
         self.next(context)
     }
 }

@@ -12,8 +12,8 @@ use {
         },
     },
     crate::{command::Families, factory::Factory},
-    daggy::{Dag, EdgeIndex, NodeIndex},
     gfx_hal::Backend,
+    graphy::{EdgeIndex, GraphAllocator, NodeIndex},
     smallvec::{smallvec, SmallVec},
     std::{any::Any, collections::HashMap, ops::Range},
 };
@@ -65,6 +65,7 @@ impl<B: Backend, T: ?Sized> GraphBuilder<B, T> {
                     })
                     .collect::<Result<_, GraphBuildError>>()?,
             ),
+            alloc: GraphAllocator::default(),
         })
     }
 }
@@ -74,6 +75,7 @@ impl<B: Backend, T: ?Sized> GraphBuilder<B, T> {
 pub struct Graph<B: Backend, T: ?Sized> {
     nodes: GraphNodes<B, T>,
     pipeline: Pipeline<B, T>,
+    alloc: GraphAllocator,
 }
 
 #[derive(derivative::Derivative)]
@@ -88,7 +90,7 @@ impl<B: Backend, T: ?Sized> Graph<B, T> {
         families: &mut Families<B>,
         aux: &T,
     ) -> Result<(), GraphRunError> {
-        let mut run_ctx = RunContext::new(factory, families);
+        let mut run_ctx = RunContext::new(factory, families, &self.alloc);
         self.nodes.run_construction_phase(&mut run_ctx, aux)?;
 
         self.pipeline.reduce(&mut run_ctx.graph.dag);
@@ -367,11 +369,12 @@ struct NodeSeed {
     resources: Range<usize>,
 }
 
-pub(crate) type PlanDag<'a, B, T> = Dag<PlanNodeData<'a, B, T>, PlanEdge>;
+pub(crate) type PlanDag<'a, B, T> = graphy::Graph<'a, PlanNodeData<'a, B, T>, PlanEdge>;
 
 #[derive(Debug)]
 pub struct PlanGraph<'a, B: Backend, T: ?Sized> {
     dag: PlanDag<'a, B, T>,
+    alloc: &'a GraphAllocator,
     images: Vec<ImageInfo>,
     buffers: Vec<BufferInfo>,
     processed_images: usize,
@@ -381,20 +384,15 @@ pub struct PlanGraph<'a, B: Backend, T: ?Sized> {
     resource_usage: Vec<ResourceUsage>,
 }
 
-impl<'a, B: Backend, T: ?Sized> Default for PlanGraph<'a, B, T> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl<'a, B: Backend, T: ?Sized> PlanGraph<'a, B, T> {
-    fn new() -> Self {
+    fn new(alloc: &'a GraphAllocator) -> Self {
         let mut dag = PlanDag::new();
         // guaranteed to always be index 0
-        dag.add_node(PlanNodeData::Root);
+        dag.insert_node(alloc, PlanNodeData::Root);
 
         Self {
             dag,
+            alloc,
             images: Vec::new(),
             buffers: Vec::new(),
             processed_images: 0,
@@ -441,28 +439,34 @@ impl<'a, B: Backend, T: ?Sized> PlanGraph<'a, B, T> {
         VirtualId(self.virtuals - 1)
     }
 
-    fn add_node(&mut self, node: PlanNodeData<'a, B, T>) -> NodeIndex {
-        self.dag.add_node(node)
+    fn insert_node(&mut self, node: PlanNodeData<'a, B, T>) -> NodeIndex {
+        self.dag.insert_node(self.alloc, node)
     }
 
-    fn add_child(
+    fn insert_child(
         &mut self,
         parent: NodeIndex,
         edge: PlanEdge,
         node: PlanNodeData<'a, B, T>,
     ) -> NodeIndex {
-        self.dag.add_child(parent, edge, node).1
+        self.dag.insert_child(self.alloc, parent, edge, node).1
     }
 
-    fn add_edge(&mut self, from: NodeIndex, to: NodeIndex, edge: PlanEdge) -> EdgeIndex {
-        self.dag.add_edge(from, to, edge).unwrap_or_else(|err| {
-            panic!(
-                "Trying to insert a cycle by adding an edge {} -> {}: {:?}",
-                from.index(),
-                to.index(),
-                err,
-            )
-        })
+    fn insert_edge(&mut self, from: NodeIndex, to: NodeIndex, edge: PlanEdge) -> EdgeIndex {
+        self.dag
+            .insert_edge_unchecked(self.alloc, from, to, edge)
+            .unwrap()
+        // TODO: implement checked version
+        // self.dag
+        //     .insert_edge(self.alloc, from, to, edge)
+        //     .unwrap_or_else(|err| {
+        //         panic!(
+        //             "Trying to insert a cycle by adding an edge {} -> {}: {:?}",
+        //             from.index(),
+        //             to.index(),
+        //             err,
+        //         )
+        //     })
     }
 
     fn process_resources(&mut self) {
@@ -474,16 +478,23 @@ impl<'a, B: Backend, T: ?Sized> PlanGraph<'a, B, T> {
                 PlanNodeData::UndefinedImage
             };
 
-            let def = self.dag.add_node(PlanNodeData::Image(ImageNode {
-                kind: info.kind,
-                levels: info.levels,
-                format: info.format,
-            }));
-            let init = self.dag.add_child(def, PlanEdge::Origin, init_data).1;
-            let version = self
+            let def = self.dag.insert_node(
+                self.alloc,
+                PlanNodeData::Image(ImageNode {
+                    kind: info.kind,
+                    levels: info.levels,
+                    format: info.format,
+                }),
+            );
+            let (_, init) = self
                 .dag
-                .add_child(init, PlanEdge::Origin, PlanNodeData::ImageVersion)
-                .1;
+                .insert_child(self.alloc, def, PlanEdge::Origin, init_data);
+            let (_, version) = self.dag.insert_child(
+                self.alloc,
+                init,
+                PlanEdge::Origin,
+                PlanNodeData::ImageVersion,
+            );
             self.last_writes
                 .insert(ResourceId::Image(ImageId(id)), version);
             self.processed_images += 1;
@@ -496,14 +507,19 @@ impl<'a, B: Backend, T: ?Sized> PlanGraph<'a, B, T> {
                 PlanNodeData::UndefinedBuffer
             };
 
-            let def = self
+            let def = self.dag.insert_node(
+                self.alloc,
+                PlanNodeData::Buffer(BufferNode { size: info.size }),
+            );
+            let (_, init) = self
                 .dag
-                .add_node(PlanNodeData::Buffer(BufferNode { size: info.size }));
-            let init = self.dag.add_child(def, PlanEdge::Origin, init_data).1;
-            let version = self
-                .dag
-                .add_child(init, PlanEdge::Origin, PlanNodeData::BufferVersion)
-                .1;
+                .insert_child(self.alloc, def, PlanEdge::Origin, init_data);
+            let (_, version) = self.dag.insert_child(
+                self.alloc,
+                init,
+                PlanEdge::Origin,
+                PlanNodeData::BufferVersion,
+            );
             self.last_writes
                 .insert(ResourceId::Image(ImageId(id)), version);
             self.processed_buffers += 1;
@@ -517,12 +533,12 @@ impl<'a, B: Backend, T: ?Sized> PlanGraph<'a, B, T> {
         // insert execution node
         let node = match exec {
             NodeExecution::RenderPass(group) => {
-                self.add_node(PlanNodeData::RenderSubpass(smallvec![group]))
+                self.insert_node(PlanNodeData::RenderSubpass(smallvec![group]))
             }
-            NodeExecution::General(run) => self.add_node(PlanNodeData::Run(run)),
+            NodeExecution::General(run) => self.insert_node(PlanNodeData::Run(run)),
             NodeExecution::Output(run) => {
-                let node = self.add_node(PlanNodeData::Run(run));
-                self.add_edge(node, NodeIndex::new(0), PlanEdge::Effect);
+                let node = self.insert_node(PlanNodeData::Run(run));
+                self.insert_edge(node, NodeIndex::new(0), PlanEdge::Effect);
                 node
             }
             NodeExecution::None => return,
@@ -542,11 +558,20 @@ impl<'a, B: Backend, T: ?Sized> PlanGraph<'a, B, T> {
                             .copied()
                             .expect("Accessing unproceessed image");
                         self.dag
-                            .add_edge(last_version, node, PlanEdge::ImageAccess(access, stage))
+                            .insert_edge_unchecked(
+                                self.alloc,
+                                last_version,
+                                node,
+                                PlanEdge::ImageAccess(access, stage),
+                            )
                             .unwrap();
                         if !access.writes().is_empty() {
-                            self.dag
-                                .add_child(node, PlanEdge::Origin, PlanNodeData::ImageVersion);
+                            self.dag.insert_child(
+                                self.alloc,
+                                node,
+                                PlanEdge::Origin,
+                                PlanNodeData::ImageVersion,
+                            );
                             self.last_writes.insert(ResourceId::Image(id), node);
                         }
                     }
@@ -559,11 +584,20 @@ impl<'a, B: Backend, T: ?Sized> PlanGraph<'a, B, T> {
                             .copied()
                             .expect("Accessing unproceessed buffer");
                         self.dag
-                            .add_edge(last_version, node, PlanEdge::BufferAccess(access, stage))
+                            .insert_edge_unchecked(
+                                self.alloc,
+                                last_version,
+                                node,
+                                PlanEdge::BufferAccess(access, stage),
+                            )
                             .unwrap();
                         if !access.writes().is_empty() {
-                            self.dag
-                                .add_child(node, PlanEdge::Origin, PlanNodeData::BufferVersion);
+                            self.dag.insert_child(
+                                self.alloc,
+                                node,
+                                PlanEdge::Origin,
+                                PlanNodeData::BufferVersion,
+                            );
                             self.last_writes.insert(ResourceId::Buffer(id), node);
                         }
                     }
@@ -571,7 +605,9 @@ impl<'a, B: Backend, T: ?Sized> PlanGraph<'a, B, T> {
                 ResourceUsage::Virtual(id, access) => {
                     if !access.is_empty() {
                         if let Some(dep) = self.last_writes.get(&ResourceId::Virtual(id)) {
-                            self.dag.add_edge(node, *dep, PlanEdge::Effect).unwrap();
+                            self.dag
+                                .insert_edge_unchecked(self.alloc, node, *dep, PlanEdge::Effect)
+                                .unwrap();
                         }
                     }
                     if !access.writes().is_empty() {
@@ -595,7 +631,11 @@ pub(crate) struct RunContext<'a, B: Backend, T: ?Sized> {
 }
 
 impl<'a, B: Backend, T: ?Sized> RunContext<'a, B, T> {
-    pub(crate) fn new(factory: &'a Factory<B>, families: &'a Families<B>) -> Self {
+    pub(crate) fn new(
+        factory: &'a Factory<B>,
+        families: &'a Families<B>,
+        allocator: &'a GraphAllocator,
+    ) -> Self {
         Self {
             factory,
             families,
@@ -603,7 +643,7 @@ impl<'a, B: Backend, T: ?Sized> RunContext<'a, B, T> {
             // buffers: Vec::new(),
             // virtuals: 0,
             output_store: OutputStore::new(),
-            graph: PlanGraph::new(),
+            graph: PlanGraph::new(allocator),
         }
     }
 }
