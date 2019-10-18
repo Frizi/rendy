@@ -1,10 +1,10 @@
 use {
     crate::new::{
-        graph::{PlanDag, PlanEdge, PlanNodeData},
+        graph::{PlanEdge, PlanNodeData},
         graph_reducer::{GraphEditor, Reducer, Reduction},
     },
     gfx_hal::Backend,
-    graphy::{Direction, EdgeIndex, NodeIndex, Walker},
+    graphy::{Direction, NodeIndex, Walker},
 };
 
 // Find render pass nodes that writes only exclusive attachments
@@ -16,33 +16,33 @@ impl<'a, B: Backend, T: ?Sized> Reducer<B, T> for CombineSubpassesReducer {
         let mut candidate_merge = None;
 
         if let Some(PlanNodeData::RenderSubpass(_)) = editor.graph().get_node(node) {
-            let mut read_attachments = walk_attachments(node.parents());
+            let mut read_attachments =
+                node.parents()
+                    .filter(|graph, &(edge, _)| match graph[edge] {
+                        PlanEdge::ImageAccess(access, _) => access.is_attachment(),
+                        _ => false,
+                    });
 
             // Do all attachments I read come from the same node? If so, which node?
             while let Some((_, access_node)) = read_attachments.walk_next(editor.graph()) {
-                // take attachment writer
-                let (_, writer) = walk_origins(access_node.parents())
+                let (_, writer) = access_node
+                    .parents()
+                    .filter(|graph, &(edge, _)| graph[edge] == PlanEdge::Origin)
                     .walk_next(editor.graph())
                     .expect("Attachment node must have an orign");
 
                 match candidate_merge {
                     Some(candidate) if candidate != writer => {
-                        // this subpass attachments are written by more than one subpass
-                        log::trace!("CombineSubpassesReducer bailout: found another writer");
+                        log::trace!("CombineSubpassesReducer bailout: more than one writer");
                         return Reduction::NoChange;
                     }
-                    None => {
-                        match editor.graph().get_node(writer) {
-                            Some(PlanNodeData::RenderSubpass(_)) => candidate_merge = Some(writer),
-                            _ => {
-                                log::trace!(
-                                    "CombineSubpassesReducer bailout: written by non-subpass"
-                                );
-                                // Written by not a subpass
-                                return Reduction::NoChange;
-                            }
+                    None => match &editor.graph()[writer] {
+                        PlanNodeData::RenderSubpass(_) => candidate_merge = Some(writer),
+                        _ => {
+                            log::trace!("CombineSubpassesReducer bailout: written by non-subpass");
+                            return Reduction::NoChange;
                         }
-                    }
+                    },
                     _ => {}
                 }
             }
@@ -77,26 +77,43 @@ impl<'a, B: Backend, T: ?Sized> Reducer<B, T> for CombineSubpassesReducer {
     }
 }
 
-fn walk_origins<'w, 'a: 'w, B: Backend, T: ?Sized + 'a>(
-    walker: impl Walker<&'w PlanDag<'a, B, T>, Item = (EdgeIndex, NodeIndex)>,
-) -> impl Walker<&'w PlanDag<'a, B, T>, Item = (EdgeIndex, NodeIndex)> {
-    walker.filter(|graph, &(edge, _)| {
-        graph.get_edge(edge).map_or(false, |e| match e {
-            PlanEdge::Origin => true,
-            _ => false,
-        })
-    })
-}
+#[derive(Debug)]
+pub(super) struct OrderWritesReducer;
+impl<B: Backend, T: ?Sized> Reducer<B, T> for OrderWritesReducer {
+    fn reduce(&mut self, editor: &mut GraphEditor<B, T>, node: NodeIndex) -> Reduction {
+        let mut write_accesses = node
+            .children()
+            .filter(|graph, &(edge, _)| match graph[edge] {
+                PlanEdge::ImageAccess(access, _) => access.is_write(),
+                PlanEdge::BufferAccess(access, _) => access.is_write(),
+                _ => false,
+            });
 
-fn walk_attachments<'w, 'a: 'w, B: Backend, T: ?Sized + 'a>(
-    walker: impl Walker<&'w PlanDag<'a, B, T>, Item = (EdgeIndex, NodeIndex)>,
-) -> impl Walker<&'w PlanDag<'a, B, T>, Item = (EdgeIndex, NodeIndex)> {
-    walker.filter(|graph, &(edge, _)| {
-        graph.get_edge(edge).map_or(false, |e| match e {
-            PlanEdge::ImageAccess(access, _) => access.is_attachment(),
-            _ => false,
-        })
-    })
+        let mut read_accesses = node
+            .children()
+            .filter(|graph, &(edge, _)| match graph[edge] {
+                PlanEdge::ImageAccess(access, _) => !access.is_write(),
+                PlanEdge::BufferAccess(access, _) => !access.is_write(),
+                _ => false,
+            });
+
+        // there should ever be at most one write access
+        let write_access = write_accesses.walk_next(editor.graph());
+        assert_eq!(None, write_accesses.walk_next(editor.graph()));
+
+        if let Some((_, write)) = write_access {
+            let mut next = read_accesses.walk_next(editor.graph());
+            while let Some((_, read)) = next {
+                editor
+                    .insert_edge_unchecked(read, write, PlanEdge::Effect)
+                    .unwrap();
+                editor.revisit(read);
+                next = read_accesses.walk_next(editor.graph());
+            }
+        }
+
+        Reduction::NoChange
+    }
 }
 
 #[cfg(all(
@@ -115,7 +132,7 @@ mod test {
         graph_reducer::GraphReducer,
         node::PassFn,
         resources::{ImageUsage, ShaderUsage},
-        test::{assert_equivalent, assert_topo_eq, test_init, visualize_graph, TestBackend},
+        test::{assert_equivalent, assert_topo_eq, test_init, TestBackend},
     };
     use smallvec::SmallVec;
 
@@ -155,7 +172,7 @@ mod test {
     #[test]
     fn test_combine_two_passes() {
         test_init();
-        let alloc = graphy::GraphAllocator::default();
+        let alloc = graphy::GraphAllocator::with_capacity(655360);
 
         let mut graph = graph! {
             [&alloc],
@@ -191,8 +208,9 @@ mod test {
             color_a -> pass = image_edge(ImageUsage::ColorAttachmentWrite);
         };
 
-        let mut reducer = GraphReducer::new().with_reducer(CombineSubpassesReducer);
-        reducer.reduce_graph(&mut graph);
+        GraphReducer::new()
+            .with_reducer(CombineSubpassesReducer)
+            .reduce_graph(&mut graph, &alloc);
         graph.trim(NodeIndex::new(0)).unwrap();
 
         assert_topo_eq(
@@ -212,7 +230,7 @@ mod test {
     #[test]
     fn test_combine_two_passes_texture_access() {
         test_init();
-        let alloc = graphy::GraphAllocator::default();
+        let alloc = graphy::GraphAllocator::with_capacity(655360);
 
         let mut graph = graph! {
             [&alloc],
@@ -271,7 +289,7 @@ mod test {
         };
 
         let mut reducer = GraphReducer::new().with_reducer(CombineSubpassesReducer);
-        reducer.reduce_graph(&mut graph);
+        reducer.reduce_graph(&mut graph, &alloc);
         graph.trim(NodeIndex::new(0)).unwrap();
         expected_graph.trim(NodeIndex::new(0)).unwrap();
 
@@ -281,7 +299,7 @@ mod test {
     #[test]
     fn test_combine_three_passes_with_depth_read() {
         test_init();
-        let alloc = graphy::GraphAllocator::default();
+        let alloc = graphy::GraphAllocator::with_capacity(655360);
 
         let mut graph = graph! {
             [&alloc],
@@ -340,7 +358,7 @@ mod test {
         };
 
         let mut reducer = GraphReducer::new().with_reducer(CombineSubpassesReducer);
-        reducer.reduce_graph(&mut graph);
+        reducer.reduce_graph(&mut graph, &alloc);
         graph.trim(NodeIndex::new(0)).unwrap();
 
         assert_equivalent(&expected_graph, &graph);
@@ -349,7 +367,7 @@ mod test {
     #[test]
     fn test_combine_three_passes_with_external_read() {
         test_init();
-        let alloc = graphy::GraphAllocator::default();
+        let alloc = graphy::GraphAllocator::with_capacity(655360);
 
         let mut graph = graph! {
             [&alloc],
@@ -357,6 +375,7 @@ mod test {
             group2 = group_node();
             @ group3 = group_node();
             group4 = group_node();
+            @ debug_pass = PlanNodeData::Run(Box::new(|_, _| Ok(())));
 
             depth_def = depth_node();
             color_def = color_node();
@@ -375,6 +394,7 @@ mod test {
             depth_c = PlanNodeData::ImageVersion;
             extra_a = PlanNodeData::ImageVersion;
             extra_b = PlanNodeData::ImageVersion;
+            extra_c = PlanNodeData::ImageVersion;
 
             color_def -> color_init = PlanEdge::Origin;
             color_init -> color_a = PlanEdge::Origin;
@@ -388,6 +408,7 @@ mod test {
             depth_a -> depth_b = PlanEdge::Version;
             depth_b -> depth_c = PlanEdge::Version;
             extra_a -> extra_b = PlanEdge::Version;
+            extra_b -> extra_c = PlanEdge::Version;
 
             color_a -> group1 = image_edge(ImageUsage::ColorAttachmentWrite);
             depth_a -> group1 = image_edge(ImageUsage::DepthStencilAttachmentWrite);
@@ -406,12 +427,16 @@ mod test {
             depth_b -> group3 = image_edge(ImageUsage::DepthStencilAttachmentRead);
             group3 -> color_c = image_edge(ImageUsage::ColorAttachmentWrite);
             group3 -> depth_b = image_edge(ImageUsage::DepthStencilAttachmentWrite);
+
+            extra_b -> debug_pass = image_edge(ImageUsage::ColorAttachmentWrite);
+            debug_pass -> extra_c = PlanEdge::Origin;
         };
 
-        let expected_graph = graph! {
+        let mut expected_graph = graph! {
             [&alloc],
             @ main_pass = subpass_node(3);
             ext_pass = subpass_node(1);
+            @ debug_pass = PlanNodeData::Run(Box::new(|_, _| Ok(())));
 
             depth_def = depth_node();
             color_def = color_node();
@@ -425,6 +450,7 @@ mod test {
             depth_a = PlanNodeData::ImageVersion;
             extra_a = PlanNodeData::ImageVersion;
             extra_b = PlanNodeData::ImageVersion;
+            extra_c = PlanNodeData::ImageVersion;
 
             color_def -> color_init = PlanEdge::Origin;
             color_init -> color_a = PlanEdge::Origin;
@@ -433,22 +459,25 @@ mod test {
             extra_def -> extra_init = PlanEdge::Origin;
             extra_init -> extra_a = PlanEdge::Origin;
             extra_a -> extra_b = PlanEdge::Version;
+            extra_b -> extra_c = PlanEdge::Version;
 
             extra_a -> ext_pass = image_edge(ImageUsage::ColorAttachmentWrite);
             ext_pass -> extra_b = PlanEdge::Origin;
             color_a -> main_pass = image_edge(ImageUsage::ColorAttachmentWrite);
             depth_a -> main_pass = image_edge(ImageUsage::DepthStencilAttachmentWrite);
             extra_b -> main_pass = image_edge(ImageUsage::Sampled(ShaderUsage::FRAGMENT));
+            extra_b -> debug_pass = image_edge(ImageUsage::ColorAttachmentWrite);
+            debug_pass -> extra_c = PlanEdge::Origin;
+            main_pass -> debug_pass = PlanEdge::Effect;
         };
 
-        let mut file = std::fs::File::create("graph.dot").unwrap();
-        visualize_graph(&mut file, &graph, "original");
-        let mut reducer = GraphReducer::new().with_reducer(CombineSubpassesReducer);
-        reducer.reduce_graph(&mut graph);
+        GraphReducer::new()
+            .with_reducer(CombineSubpassesReducer)
+            .with_reducer(OrderWritesReducer)
+            .reduce_graph(&mut graph, &alloc);
 
-        visualize_graph(&mut file, &graph, "transformed");
         graph.trim(NodeIndex::new(0)).unwrap();
-        visualize_graph(&mut file, &graph, "trimmed");
+        expected_graph.trim(NodeIndex::new(0)).unwrap();
 
         assert_equivalent(&expected_graph, &graph);
     }

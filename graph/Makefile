@@ -1,5 +1,5 @@
 graphviz:
-	dot -Gpackmode=graph -Gquantum=0.5 -Nfontname=consolas *.dot | gvpack -array_i | dot -Tsvg -o graph.svg
+	dot -Gsize="20,30" -Gpackmode=graph -Gquantum=0.5 -Nfontname=consolas *.dot | gvpack -g -u -array_r2 -m30 | neato  -n2 -Tsvg -o graph.svg
 
 watch:
-	entr 
+	while true; do ls *.dot | entr -d -s 'make graphviz'; done

@@ -1,20 +1,11 @@
 use {
     crate::new::{graph::PlanDag, graph_reducer::GraphReducer},
     gfx_hal::Backend,
+    graphy::{GraphAllocator, NodeIndex},
 };
 
-// macro_rules! try_reduce {
-//     ($x:expr) => {
-//         match $x {
-//             Some(v) => v,
-//             _ => return crate::new::graph_reducer::Reduction::NoChange,
-//         }
-//     };
-// }
-//
-
 mod subpasses;
-use subpasses::CombineSubpassesReducer;
+use subpasses::{CombineSubpassesReducer, OrderWritesReducer};
 
 #[derive(derivative::Derivative)]
 #[derivative(Debug(bound = ""))]
@@ -25,10 +16,13 @@ pub(crate) struct Pipeline<B: Backend, T: ?Sized> {
 impl<B: Backend, T: ?Sized> Pipeline<B, T> {
     pub(crate) fn new() -> Self {
         Self {
-            stage1: GraphReducer::new().with_reducer(CombineSubpassesReducer),
+            stage1: GraphReducer::new()
+                .with_reducer(CombineSubpassesReducer)
+                .with_reducer(OrderWritesReducer),
         }
     }
-    pub(crate) fn reduce(&mut self, graph: &mut PlanDag<'_, B, T>) {
-        self.stage1.reduce_graph(graph);
+    pub(crate) fn reduce<'a>(&mut self, graph: &mut PlanDag<'a, B, T>, alloc: &'a GraphAllocator) {
+        self.stage1.reduce_graph(graph, alloc);
+        graph.trim(NodeIndex::new(0)).unwrap();
     }
 }

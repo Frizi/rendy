@@ -1,6 +1,6 @@
-use super::graph::PlanDag;
+use super::graph::{PlanDag, PlanEdge};
 use gfx_hal::Backend;
-use graphy::{Direction, NodeIndex, Walker};
+use graphy::{Direction, EdgeIndex, GraphAllocator, GraphError, NodeIndex, Walker};
 
 #[derive(Debug)]
 pub enum Reduction {
@@ -168,6 +168,7 @@ impl ReductionState {
         &mut self,
         reducers: &mut Reducers<B, T>,
         graph: &mut PlanDag<'a, B, T>,
+        alloc: &'a GraphAllocator,
         node: NodeIndex,
     ) -> Reduction {
         let mut skip = reducers.len();
@@ -181,7 +182,11 @@ impl ReductionState {
                 i += 1;
                 continue;
             }
-            let mut editor = GraphEditor { state: self, graph };
+            let mut editor = GraphEditor {
+                state: self,
+                graph,
+                alloc,
+            };
             let reduction: Reduction = reducers[i].reduce(&mut editor, node);
             match reduction {
                 Reduction::NoChange => {
@@ -222,6 +227,7 @@ impl ReductionState {
         &mut self,
         reducers: &mut Reducers<B, T>,
         graph: &mut PlanDag<'a, B, T>,
+        alloc: &'a GraphAllocator,
         node: NodeIndex,
     ) {
         debug_assert!(self.stack.is_empty());
@@ -234,7 +240,7 @@ impl ReductionState {
             if !self.stack.is_empty() {
                 // Process the node on the top of the stack, potentially pushing more or
                 // popping the node off the stack.
-                self.reduce_top(reducers, graph);
+                self.reduce_top(reducers, graph, alloc);
             } else if let Some(node) = self.revisit.pop() {
                 // If the stack becomes empty, revisit any nodes in the revisit queue.
                 if self.state(node) == State::Revisit {
@@ -243,7 +249,11 @@ impl ReductionState {
                 }
             } else {
                 // Run all finalizers.
-                let mut editor = GraphEditor { state: self, graph };
+                let mut editor = GraphEditor {
+                    state: self,
+                    graph,
+                    alloc,
+                };
                 for reducer in reducers.iter_mut() {
                     reducer.finalize(&mut editor);
                 }
@@ -303,6 +313,7 @@ impl ReductionState {
         &mut self,
         reducers: &mut Reducers<B, T>,
         graph: &mut PlanDag<'a, B, T>,
+        alloc: &'a GraphAllocator,
     ) {
         let node = self.stack.last().unwrap().node;
 
@@ -323,7 +334,7 @@ impl ReductionState {
         let max_id = NodeIndex::new(graph.node_count() - 1);
 
         // All inputs should be visited or on stack. Apply reductions to node.
-        match self.reduce(reducers, graph, node) {
+        match self.reduce(reducers, graph, alloc, node) {
             Reduction::NoChange => {
                 // If there was no reduction, pop {node} and continue.
                 self.pop();
@@ -355,6 +366,7 @@ impl ReductionState {
 pub(crate) struct GraphEditor<'a, 'b: 'a, B: Backend, T: ?Sized> {
     state: &'a mut ReductionState,
     graph: &'a mut PlanDag<'b, B, T>,
+    alloc: &'b GraphAllocator,
 }
 
 impl<'a, 'b: 'a, B: Backend, T: ?Sized> GraphEditor<'a, 'b, B, T> {
@@ -382,6 +394,15 @@ impl<'a, 'b: 'a, B: Backend, T: ?Sized> GraphEditor<'a, 'b, B, T> {
     pub(crate) fn is_dead(&self, node: NodeIndex) -> bool {
         self.state.is_dead(node)
     }
+
+    pub(crate) fn insert_edge_unchecked(
+        &mut self,
+        from: NodeIndex,
+        to: NodeIndex,
+        edge: PlanEdge,
+    ) -> Result<EdgeIndex, GraphError> {
+        self.graph.insert_edge_unchecked(self.alloc, from, to, edge)
+    }
 }
 
 impl<B: Backend, T: ?Sized> GraphReducer<B, T> {
@@ -405,8 +426,12 @@ impl<B: Backend, T: ?Sized> GraphReducer<B, T> {
         self
     }
 
-    pub(crate) fn reduce_graph<'a>(&mut self, graph: &mut PlanDag<'a, B, T>) {
+    pub(crate) fn reduce_graph<'a>(
+        &mut self,
+        graph: &mut PlanDag<'a, B, T>,
+        alloc: &'a GraphAllocator,
+    ) {
         self.state
-            .reduce_node(&mut self.reducers, graph, NodeIndex::new(0))
+            .reduce_node(&mut self.reducers, graph, alloc, NodeIndex::new(0))
     }
 }

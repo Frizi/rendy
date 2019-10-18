@@ -109,6 +109,10 @@ impl NodeImageAccess {
                 | Self::DEPTH_STENCIL_ATTACHMENT_WRITE,
         )
     }
+
+    pub fn is_write(&self) -> bool {
+        !self.writes().is_empty()
+    }
 }
 
 impl NodeBufferAccess {
@@ -127,6 +131,10 @@ impl NodeBufferAccess {
     pub fn writes(&self) -> Self {
         *self
             & (Self::STORAGE_BUFFER_WRITE | Self::STORAGE_TEXEL_BUFFER_WRITE | Self::TRANSFER_WRITE)
+    }
+
+    pub fn is_write(&self) -> bool {
+        !self.writes().is_empty()
     }
 }
 

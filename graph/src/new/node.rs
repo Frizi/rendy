@@ -32,7 +32,9 @@ pub trait Node<B: Backend, T: ?Sized>: std::fmt::Debug + Send + Sync {
 
     /// Dispose of the node.
     /// Called after device idle
-    fn dispose(self: Box<Self>, factory: &mut Factory<B>, aux: &T);
+    fn dispose(self: Box<Self>, factory: &mut Factory<B>, aux: &T) {
+        let _ = (factory, aux);
+    }
 }
 
 /// Holds the output variable data of all constructed nodes.
@@ -371,6 +373,13 @@ impl<'n, B: Backend, T: ?Sized> NodeExecution<'n, B, T> {
         F: for<'a> FnOnce(ExecContext<'a, B>, &'a T) -> ExecResult + 'n,
     {
         Self::General(Box::new(general_closure))
+    }
+
+    pub fn output<F>(general_closure: F) -> Self
+    where
+        F: for<'a> FnOnce(ExecContext<'a, B>, &'a T) -> ExecResult + 'n,
+    {
+        Self::Output(Box::new(general_closure))
     }
 }
 

@@ -65,7 +65,7 @@ impl<B: Backend, T: ?Sized> GraphBuilder<B, T> {
                     })
                     .collect::<Result<_, GraphBuildError>>()?,
             ),
-            alloc: GraphAllocator::default(),
+            alloc: GraphAllocator::with_capacity(52_428_800),
         })
     }
 }
@@ -90,10 +90,14 @@ impl<B: Backend, T: ?Sized> Graph<B, T> {
         families: &mut Families<B>,
         aux: &T,
     ) -> Result<(), GraphRunError> {
+        unsafe {
+            self.alloc.reset();
+        }
+
         let mut run_ctx = RunContext::new(factory, families, &self.alloc);
         self.nodes.run_construction_phase(&mut run_ctx, aux)?;
 
-        self.pipeline.reduce(&mut run_ctx.graph.dag);
+        self.pipeline.reduce(&mut run_ctx.graph.dag, &self.alloc);
 
         // Graph lowering
         // All graph excution types are eventually becoming a "General" nodes
@@ -255,6 +259,12 @@ pub(crate) struct BufferNode {
     pub(crate) size: u64,
 }
 
+// struct SubpassDesc {}
+
+// struct PassNode {
+//     groups: SmallVec<[PassFn<'n, B, T>; 4]>,
+// }
+
 pub(crate) enum PlanNodeData<'n, B: Backend, T: ?Sized> {
     /// Construction phase execution
     // Execution(NodeExecution<'a, B, T>),
@@ -272,6 +282,7 @@ pub(crate) enum PlanNodeData<'n, B: Backend, T: ?Sized> {
     UndefinedBuffer,
     /// A subpass that might have multiple render groups.
     RenderSubpass(SmallVec<[PassFn<'n, B, T>; 4]>),
+    // RenderPass(SmallVec<[PassFn<'n, B, T>; 4]>),
     /// A node representing arbitrary runnable operation. All Op nodes are eventually lowered into it.
     Run(GeneralFn<'n, B, T>),
     /// Resolve multisampled image into non-multisampled one.
@@ -315,8 +326,6 @@ pub(crate) enum PlanEdge {
     /// Target node accesses connected source image version.
     ImageAccess(NodeImageAccess, gfx_hal::pso::PipelineStage),
     BufferAccess(NodeBufferAccess, gfx_hal::pso::PipelineStage),
-    /// Target node uses connected source image version as an attachment.
-    Attachment(Attachment),
     /// A node-to-node execution order dependency
     Effect,
     /// Resource version relation. Version increases in the edge direction
@@ -489,14 +498,8 @@ impl<'a, B: Backend, T: ?Sized> PlanGraph<'a, B, T> {
             let (_, init) = self
                 .dag
                 .insert_child(self.alloc, def, PlanEdge::Origin, init_data);
-            let (_, version) = self.dag.insert_child(
-                self.alloc,
-                init,
-                PlanEdge::Origin,
-                PlanNodeData::ImageVersion,
-            );
             self.last_writes
-                .insert(ResourceId::Image(ImageId(id)), version);
+                .insert(ResourceId::Image(ImageId(id)), init);
             self.processed_images += 1;
         }
         for info in self.buffers.drain(..) {
@@ -514,14 +517,8 @@ impl<'a, B: Backend, T: ?Sized> PlanGraph<'a, B, T> {
             let (_, init) = self
                 .dag
                 .insert_child(self.alloc, def, PlanEdge::Origin, init_data);
-            let (_, version) = self.dag.insert_child(
-                self.alloc,
-                init,
-                PlanEdge::Origin,
-                PlanNodeData::BufferVersion,
-            );
             self.last_writes
-                .insert(ResourceId::Image(ImageId(id)), version);
+                .insert(ResourceId::Image(ImageId(id)), init);
             self.processed_buffers += 1;
         }
     }
@@ -566,13 +563,13 @@ impl<'a, B: Backend, T: ?Sized> PlanGraph<'a, B, T> {
                             )
                             .unwrap();
                         if !access.writes().is_empty() {
-                            self.dag.insert_child(
+                            let (_, version) = self.dag.insert_child(
                                 self.alloc,
                                 node,
                                 PlanEdge::Origin,
                                 PlanNodeData::ImageVersion,
                             );
-                            self.last_writes.insert(ResourceId::Image(id), node);
+                            self.last_writes.insert(ResourceId::Image(id), version);
                         }
                     }
                 }
@@ -592,13 +589,13 @@ impl<'a, B: Backend, T: ?Sized> PlanGraph<'a, B, T> {
                             )
                             .unwrap();
                         if !access.writes().is_empty() {
-                            self.dag.insert_child(
+                            let (_, version) = self.dag.insert_child(
                                 self.alloc,
                                 node,
                                 PlanEdge::Origin,
                                 PlanNodeData::BufferVersion,
                             );
-                            self.last_writes.insert(ResourceId::Buffer(id), node);
+                            self.last_writes.insert(ResourceId::Buffer(id), version);
                         }
                     }
                 }
@@ -654,4 +651,238 @@ pub enum GraphRunError {
     NodeConstruction(NodeId, NodeConstructionError),
     /// Error during node execution phase in the graph.
     NodeExecution(NodeId, NodeExecutionError),
+}
+
+#[cfg(all(
+    test,
+    any(
+        feature = "empty",
+        feature = "dx12",
+        feature = "metal",
+        feature = "vulkan"
+    )
+))]
+mod test {
+    use super::*;
+    use crate::{
+        command::Family,
+        factory::Factory,
+        new::test::{test_init, visualize_graph, TestBackend},
+    };
+
+    impl NodeBuilder<TestBackend, ()> for ImageInfo {
+        type Node = Self;
+        type Family = crate::command::Transfer;
+        fn build(
+            self: Box<Self>,
+            _: &mut Factory<TestBackend>,
+            _: &mut Family<TestBackend>,
+            _: &(),
+        ) -> Result<Self::Node, NodeBuildError> {
+            Ok(*self)
+        }
+    }
+
+    impl Node<TestBackend, ()> for ImageInfo {
+        type Outputs = Parameter<ImageId>;
+        fn construct(
+            &mut self,
+            ctx: &mut NodeContext<TestBackend, ()>,
+            _: &(),
+        ) -> Result<(ImageId, NodeExecution<'_, TestBackend, ()>), NodeConstructionError> {
+            let image = ctx.create_image(*self);
+            Ok((image, NodeExecution::None))
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestPass {
+        color: Parameter<ImageId>,
+        depth: Option<Parameter<ImageId>>,
+    }
+
+    impl TestPass {
+        fn new(color: Parameter<ImageId>, depth: Option<Parameter<ImageId>>) -> Self {
+            Self { color, depth }
+        }
+    }
+
+    impl NodeBuilder<TestBackend, ()> for TestPass {
+        type Node = Self;
+        type Family = crate::command::Graphics;
+        fn build(
+            self: Box<Self>,
+            _: &mut Factory<TestBackend>,
+            _: &mut Family<TestBackend>,
+            _: &(),
+        ) -> Result<Self::Node, NodeBuildError> {
+            Ok(*self)
+        }
+    }
+
+    impl Node<TestBackend, ()> for TestPass {
+        type Outputs = ();
+
+        fn construct(
+            &mut self,
+            ctx: &mut NodeContext<TestBackend, ()>,
+            _: &(),
+        ) -> Result<((), NodeExecution<'_, TestBackend, ()>), NodeConstructionError> {
+            let color = *ctx.get_parameter(self.color)?;
+            ctx.use_image(color, ImageUsage::ColorAttachmentWrite);
+            if let Some(depth) = self.depth {
+                let depth = *ctx.get_parameter(depth)?;
+                ctx.use_image(depth, ImageUsage::DepthStencilAttachmentWrite);
+            }
+
+            Ok(((), NodeExecution::pass(|_, _| Ok(()))))
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestPass2 {
+        color1: Parameter<ImageId>,
+        color2: Parameter<ImageId>,
+        depth: Option<Parameter<ImageId>>,
+    }
+
+    impl TestPass2 {
+        fn new(
+            color1: Parameter<ImageId>,
+            color2: Parameter<ImageId>,
+            depth: Option<Parameter<ImageId>>,
+        ) -> Self {
+            Self {
+                color1,
+                color2,
+                depth,
+            }
+        }
+    }
+
+    impl NodeBuilder<TestBackend, ()> for TestPass2 {
+        type Node = Self;
+        type Family = crate::command::Graphics;
+        fn build(
+            self: Box<Self>,
+            _: &mut Factory<TestBackend>,
+            _: &mut Family<TestBackend>,
+            _: &(),
+        ) -> Result<Self::Node, NodeBuildError> {
+            Ok(*self)
+        }
+    }
+
+    impl Node<TestBackend, ()> for TestPass2 {
+        type Outputs = ();
+
+        fn construct(
+            &mut self,
+            ctx: &mut NodeContext<TestBackend, ()>,
+            _: &(),
+        ) -> Result<((), NodeExecution<'_, TestBackend, ()>), NodeConstructionError> {
+            let color1 = *ctx.get_parameter(self.color1)?;
+            let color2 = *ctx.get_parameter(self.color2)?;
+            ctx.use_image(color1, ImageUsage::ColorAttachmentWrite);
+            ctx.use_image(color2, ImageUsage::ColorAttachmentRead);
+            if let Some(depth) = self.depth {
+                let depth = *ctx.get_parameter(depth)?;
+                ctx.use_image(depth, ImageUsage::DepthStencilAttachmentRead);
+            }
+
+            Ok(((), NodeExecution::pass(|_, _| Ok(()))))
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestOutput;
+
+    impl NodeBuilder<TestBackend, ()> for TestOutput {
+        type Node = Self;
+        type Family = crate::command::Graphics;
+        fn build(
+            self: Box<Self>,
+            _: &mut Factory<TestBackend>,
+            _: &mut Family<TestBackend>,
+            _: &(),
+        ) -> Result<Self::Node, NodeBuildError> {
+            Ok(*self)
+        }
+    }
+
+    impl Node<TestBackend, ()> for TestOutput {
+        type Outputs = Parameter<ImageId>;
+        fn construct(
+            &mut self,
+            ctx: &mut NodeContext<TestBackend, ()>,
+            _: &(),
+        ) -> Result<(ImageId, NodeExecution<'_, TestBackend, ()>), NodeConstructionError> {
+            let output = ctx.create_image(ImageInfo {
+                kind: gfx_hal::image::Kind::D2(1024, 1024, 1, 1),
+                levels: 1,
+                format: gfx_hal::format::Format::Rgba8Unorm,
+                clear: None,
+            });
+            ctx.use_image(output, ImageUsage::ColorAttachmentRead);
+            Ok((output, NodeExecution::output(|_, _| Ok(()))))
+        }
+    }
+
+    #[test]
+    fn test_construction() {
+        test_init();
+        let mut file = std::fs::File::create("graph.dot").unwrap();
+
+        let config: crate::factory::Config = Default::default();
+        let (mut factory, mut families): (Factory<TestBackend>, _) =
+            crate::factory::init(config).unwrap();
+
+        let mut builder = GraphBuilder::new();
+
+        let depth = builder.add(ImageInfo {
+            kind: gfx_hal::image::Kind::D2(1, 1, 1, 1),
+            levels: 1,
+            format: gfx_hal::format::Format::R32Sfloat,
+            clear: Some(gfx_hal::command::ClearValue {
+                depth_stencil: gfx_hal::command::ClearDepthStencil {
+                    depth: 0.0,
+                    stencil: 0,
+                },
+            }),
+        });
+        let depth2 = builder.add(ImageInfo {
+            kind: gfx_hal::image::Kind::D2(1, 1, 1, 1),
+            levels: 1,
+            format: gfx_hal::format::Format::R32Sfloat,
+            clear: None,
+        });
+        let color2 = builder.add(ImageInfo {
+            kind: gfx_hal::image::Kind::D2(1, 1, 1, 1),
+            levels: 1,
+            format: gfx_hal::format::Format::Rgba8Unorm,
+            clear: None,
+        });
+        let color = builder.add(TestOutput);
+        builder.add(TestPass::new(color, Some(depth)));
+        builder.add(TestPass::new(color2, Some(depth2)));
+        builder.add(TestPass::new(color, Some(depth)));
+        builder.add(TestPass::new(color2, Some(depth2)));
+        builder.add(TestPass2::new(color2, color, None));
+        builder.add(TestPass2::new(color, color2, Some(depth2)));
+        builder.add(TestPass2::new(color, color2, Some(depth2)));
+        builder.add(TestPass::new(color, Some(depth)));
+        builder.add(TestPass::new(color, Some(depth)));
+        builder.add(TestPass::new(color, None));
+
+        let mut graph = builder.build(&mut factory, &mut families, &()).unwrap();
+
+        let mut run_ctx = RunContext::new(&factory, &families, &graph.alloc);
+        graph
+            .nodes
+            .run_construction_phase(&mut run_ctx, &())
+            .unwrap();
+        visualize_graph(&mut file, &run_ctx.graph.dag, "raw");
+        graph.pipeline.reduce(&mut run_ctx.graph.dag, &graph.alloc);
+        visualize_graph(&mut file, &run_ctx.graph.dag, "opti");
+    }
 }

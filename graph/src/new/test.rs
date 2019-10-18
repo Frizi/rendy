@@ -95,48 +95,20 @@ pub fn assert_equivalent<A: std::fmt::Debug, B: PartialEq + std::fmt::Debug>(
     use crate::new::walker::{GraphItem, TopoWithEdges};
     use graphy::{NodeIndex, Walker};
 
-    let expected_topo: Vec<GraphItem> = TopoWithEdges::new(expected_graph, NodeIndex::new(0))
+    let format_item = |graph: &graphy::Graph<A, B>, item| match item {
+        GraphItem::Node(n) => format!("Node({:?})", graph[n]),
+        GraphItem::Edge(e) => format!("Edge({:?})", graph[e]),
+    };
+
+    let expected_topo: Vec<_> = TopoWithEdges::new(expected_graph, NodeIndex::new(0))
+        .map(format_item)
         .iter(expected_graph)
         .collect();
-    let actual_topo: Vec<GraphItem> = TopoWithEdges::new(actual_graph, NodeIndex::new(0))
+    let actual_topo: Vec<_> = TopoWithEdges::new(actual_graph, NodeIndex::new(0))
+        .map(format_item)
         .iter(actual_graph)
         .collect();
-
-    for (expected_item, actual_item) in expected_topo.iter().zip(actual_topo.iter()) {
-        match (expected_item, actual_item) {
-            (GraphItem::Node(expected), GraphItem::Node(actual)) => {
-                let expected = expected_graph.get_node(*expected).unwrap();
-                let actual = actual_graph.get_node(*actual).unwrap();
-                let expected = format!("{:?}", expected);
-                let actual = format!("{:?}", actual);
-                log::trace!("n: {} == {}", expected, actual);
-                assert_eq!(expected, actual);
-            }
-            (GraphItem::Edge(expected), GraphItem::Edge(actual)) => {
-                let expected = expected_graph.get_edge(*expected).unwrap();
-                let actual = actual_graph.get_edge(*actual).unwrap();
-                log::trace!("e: {:?} == {:?}", expected, actual);
-                assert_eq!(expected, actual);
-            }
-            (GraphItem::Node(expected), GraphItem::Edge(actual)) => {
-                let expected = expected_graph.get_node(*expected).unwrap();
-                let actual = actual_graph.get_edge(*actual).unwrap();
-                panic!(
-                    "Expected item of different kind. \n left: `Node({:?})`,\nright: Edge({:?})",
-                    expected, actual
-                );
-            }
-            (GraphItem::Edge(expected), GraphItem::Node(actual)) => {
-                let expected = expected_graph.get_edge(*expected).unwrap();
-                let actual = actual_graph.get_node(*actual).unwrap();
-                panic!(
-                    "Expected item of different kind. \n left: `Edge({:?})`,\nright: `Node({:?})`",
-                    expected, actual
-                );
-            }
-        }
-    }
-    assert_eq!(expected_topo.len(), actual_topo.len());
+    assert_eq!(expected_topo, actual_topo);
 }
 
 pub(crate) fn visualize_graph<B: gfx_hal::Backend, T: ?Sized>(
@@ -163,9 +135,11 @@ pub(crate) fn visualize_graph<B: gfx_hal::Backend, T: ?Sized>(
             match self.0.get_node(index).unwrap() {
                 PlanNodeData::Root => "#99aaff",
                 PlanNodeData::Image { .. } => "#0000ff",
-                PlanNodeData::ImageVersion => "#0000aa",
+                PlanNodeData::ImageVersion => "#2266ff",
                 PlanNodeData::UndefinedImage => "#2266ff",
-                PlanNodeData::ClearImage(_) => "#0000cc",
+                PlanNodeData::ClearImage(_) => "#2266ff",
+                PlanNodeData::RenderSubpass(_) => "#03c03c",
+                PlanNodeData::Run(_) => "#9b03c0",
                 _ => "black",
             }
         }
@@ -173,6 +147,12 @@ pub(crate) fn visualize_graph<B: gfx_hal::Backend, T: ?Sized>(
             match node {
                 PlanNodeData::Root => format!("<font color=\"white\">{}</font>", self.1),
                 PlanNodeData::Image(im) => format!("<table border='0' cellborder='1' cellspacing='0'><tr><td><b>Image</b></td></tr><tr><td>{:?}</td></tr><tr><td>{:?}, levels: {:?}</td></tr></table>", im.kind, im.format, im.levels),
+                PlanNodeData::ClearImage(c) => format!(
+                    "<table border='0' cellborder='1' cellspacing='0'><tr><td><b>ClearImage</b></td></tr><tr><td>color: {:?}</td></tr><tr><td>depth: {:?}, stencil: {:?}</td></tr></table>",
+                    unsafe { c.color.uint32 },
+                    unsafe { c.depth_stencil.depth },
+                    unsafe { c.depth_stencil.stencil },
+                ),
                 n => format!("{:?}", n),
             }
         }
@@ -258,6 +238,7 @@ pub(crate) fn visualize_graph<B: gfx_hal::Backend, T: ?Sized>(
                 Item::Node(n) => match self.0.get_node(*n).unwrap() {
                     PlanNodeData::Root => "circle",
                     PlanNodeData::Image(_) => "plain",
+                    PlanNodeData::ClearImage(_) => "plain",
                     _ => "box",
                 },
                 Item::Edge(_) => "plain",

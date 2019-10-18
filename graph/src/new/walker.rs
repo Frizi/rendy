@@ -49,7 +49,7 @@ impl Topo {
     }
 }
 
-impl<'a, N, E> Walker<&Graph<'a, N, E>> for Topo {
+impl<'a, N, E> Walker<Graph<'a, N, E>> for Topo {
     type Item = NodeIndex;
     fn walk_next(&mut self, context: &Graph<'a, N, E>) -> Option<Self::Item> {
         self.next(context)
@@ -128,7 +128,7 @@ impl TopoWithEdges {
     }
 }
 
-impl<'a, N, E> Walker<&Graph<'a, N, E>> for TopoWithEdges {
+impl<'a, N, E> Walker<Graph<'a, N, E>> for TopoWithEdges {
     type Item = GraphItem;
     fn walk_next(&mut self, context: &Graph<'a, N, E>) -> Option<Self::Item> {
         self.next(context)
