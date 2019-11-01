@@ -7,12 +7,17 @@ use {
         },
         pipeline::Pipeline,
         resources::{
-            BufferId, BufferInfo, BufferUsage, ImageId, ImageInfo, ImageUsage, NodeBufferAccess,
-            NodeImageAccess, NodeVirtualAccess, ResourceId, ResourceUsage, VirtualId,
+            AttachmentAccess, BufferId, BufferInfo, BufferUsage, ImageId, ImageInfo, ImageLoad,
+            ImageUsage, NodeBufferAccess, NodeImageAccess, NodeVirtualAccess, ResourceId,
+            ResourceUsage, ShaderUsage, VirtualId,
         },
     },
-    crate::{command::Families, factory::Factory},
-    gfx_hal::Backend,
+    crate::{
+        command::Families,
+        factory::Factory,
+        resource::{Handle, Image},
+    },
+    gfx_hal::{pass::ATTACHMENT_UNUSED, Backend},
     graphy::{EdgeIndex, GraphAllocator, NodeIndex},
     smallvec::{smallvec, SmallVec},
     std::{any::Any, collections::HashMap, ops::Range},
@@ -156,6 +161,7 @@ impl<B: Backend, T: ?Sized> Graph<B, T> {
 }
 
 impl<B: Backend, T: ?Sized> GraphNodes<B, T> {
+    #[inline(never)]
     fn run_construction_phase<'a: 'b, 'b>(
         &'a mut self,
         run_ctx: &mut RunContext<'b, B, T>,
@@ -168,24 +174,26 @@ impl<B: Backend, T: ?Sized> GraphNodes<B, T> {
             let mut seed = run_ctx.graph.seed();
 
             let execution = {
-                let mut ctx = NodeContext {
-                    id: NodeId(i),
-                    run: run_ctx,
-                    seed: &mut seed,
-                };
+                let mut ctx = NodeContext::new(NodeId(i), &mut seed, run_ctx);
                 node.construct(&mut ctx, aux)
                     .map_err(|e| GraphRunError::NodeConstruction(NodeId(i), e))?
             };
 
             if execution.is_output() {
-                outputs.push((seed, execution));
+                outputs.push((i, seed, execution));
             } else {
-                run_ctx.graph.insert(seed, execution);
+                run_ctx
+                    .graph
+                    .insert(seed, execution)
+                    .map_err(|e| GraphRunError::NodeConstruction(NodeId(i), e))?;
             }
         }
 
-        for (seed, execution) in outputs.drain().rev() {
-            run_ctx.graph.insert(seed, execution);
+        for (i, seed, execution) in outputs.drain().rev() {
+            run_ctx
+                .graph
+                .insert(seed, execution)
+                .map_err(|e| GraphRunError::NodeConstruction(NodeId(i), e))?;
         }
 
         Ok(())
@@ -195,18 +203,30 @@ impl<B: Backend, T: ?Sized> GraphNodes<B, T> {
 /// A context for rendergraph node construction phase. Contains all data that the node
 /// get access to and contains ready-made methods for common operations.
 #[derive(Debug)]
-pub struct NodeContext<'a, 'b, B: Backend, T: ?Sized> {
+pub struct NodeContext<'a, 'arena, B: Backend, T: ?Sized> {
     id: NodeId,
     seed: &'a mut NodeSeed,
-    run: &'a mut RunContext<'b, B, T>,
+    run: &'a mut RunContext<'arena, B, T>,
+    next_image_id: usize,
+    next_buffer_id: usize,
 }
 
-impl<'a, 'b, B: Backend, T: ?Sized> NodeContext<'a, 'b, B, T> {
+impl<'a, 'arena, B: Backend, T: ?Sized> NodeContext<'a, 'arena, B, T> {
+    fn new(id: NodeId, seed: &'a mut NodeSeed, run: &'a mut RunContext<'arena, B, T>) -> Self {
+        Self {
+            id,
+            seed,
+            run,
+            next_image_id: 0,
+            next_buffer_id: 0,
+        }
+    }
+
     pub(crate) fn set_outputs(&mut self, vals: impl Iterator<Item = Box<dyn Any>>) {
         self.run.output_store.set_all(self.id, vals);
     }
 
-    pub fn factory(&self) -> &'a Factory<B> {
+    pub fn factory(&self) -> &'arena Factory<B> {
         self.run.factory
     }
     pub fn get_parameter<P: Any>(&self, id: Parameter<P>) -> Result<&P, NodeConstructionError> {
@@ -217,38 +237,94 @@ impl<'a, 'b, B: Backend, T: ?Sized> NodeContext<'a, 'b, B, T> {
     }
     /// Create new image owned by graph.
     pub fn create_image(&mut self, image_info: ImageInfo) -> ImageId {
-        self.run.graph.create_image(image_info)
+        let id = ImageId(self.id, self.next_image_id);
+        self.next_image_id += 1;
+        self.run.graph.create_image(id, image_info)
     }
     /// Create new buffer owned by graph.
     pub fn create_buffer(&mut self, buffer_info: BufferInfo) -> BufferId {
-        self.run.graph.create_buffer(buffer_info)
+        let id = BufferId(self.id, self.next_buffer_id);
+        self.next_buffer_id += 1;
+        self.run.graph.create_buffer(id, buffer_info)
     }
     /// Create non-data dependency target. A virtual resource intended to
     /// describe dependencies between rendering nodes without carrying any data.
     pub fn create_virtual(&mut self) -> VirtualId {
         self.run.graph.create_virtual()
     }
-    pub fn use_virtual(&mut self, id: VirtualId, access: NodeVirtualAccess) {
+    pub fn use_virtual(
+        &mut self,
+        id: VirtualId,
+        access: NodeVirtualAccess,
+    ) -> Result<(), NodeConstructionError> {
         self.run
             .graph
-            .use_resource(self.seed, ResourceUsage::Virtual(id, access));
+            .use_resource(self.seed, ResourceUsage::Virtual(id, access))
     }
     /// Declare usage of image by the node
-    pub fn use_image(&mut self, id: ImageId, usage: ImageUsage) {
+    pub fn use_image(
+        &mut self,
+        id: ImageId,
+        usage: ImageUsage,
+    ) -> Result<(), NodeConstructionError> {
         self.run
             .graph
-            .use_resource(self.seed, usage.resource_usage(id));
+            .use_resource(self.seed, usage.resource_usage(id))
     }
     /// Declare usage of buffer by the node
-    pub fn use_buffer(&mut self, id: BufferId, usage: BufferUsage) {
+    pub fn use_buffer(
+        &mut self,
+        id: BufferId,
+        usage: BufferUsage,
+    ) -> Result<(), NodeConstructionError> {
         self.run
             .graph
-            .use_resource(self.seed, usage.resource_usage(id));
+            .use_resource(self.seed, usage.resource_usage(id))
+    }
+    /// Declare usage of a color attachment in render pass node.
+    ///
+    /// This is mutually exclusive with `use_image` calls on the same image,
+    /// and will cause construction error when non-renderpass execution is returned.
+    pub fn use_color(&mut self, index: usize, image: ImageId) -> Result<(), NodeConstructionError> {
+        self.run
+            .graph
+            .use_resource(self.seed, ResourceUsage::ColorAttachment(image, index))
+    }
+    /// Declare usage of a depth/stencil attachment in render pass node.
+    /// Depth attachment access can be read-only when depth write is never enabled in this pass.
+    ///
+    /// This is mutually exclusive with `use_image` calls on the same image,
+    /// and will cause construction error when non-renderpass execution is returned.
+    pub fn use_depth(
+        &mut self,
+        image: ImageId,
+        write_access: bool,
+    ) -> Result<(), NodeConstructionError> {
+        let access = if write_access {
+            AttachmentAccess::ReadWrite
+        } else {
+            AttachmentAccess::ReadOnly
+        };
+        self.run
+            .graph
+            .use_resource(self.seed, ResourceUsage::DepthAttachment(image, access))
+    }
+    /// Declare usage of an input attachment in render pass node.
+    /// Input attachment access is always read-only and limited to fragment shaders.
+    ///
+    /// This is mutually exclusive with `use_image` calls on the same image,
+    /// and will cause construction error when non-renderpass execution is returned.
+    pub fn use_input(&mut self, index: usize, image: ImageId) -> Result<(), NodeConstructionError> {
+        self.run
+            .graph
+            .use_resource(self.seed, ResourceUsage::InputAttachment(image, index))
     }
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct ImageNode {
+    // The ID is only used to later retreive the image in execution phase
+    pub(crate) id: ImageId,
     pub(crate) kind: gfx_hal::image::Kind,
     pub(crate) levels: gfx_hal::image::Level,
     pub(crate) format: gfx_hal::format::Format,
@@ -256,16 +332,11 @@ pub(crate) struct ImageNode {
 
 #[derive(Debug, Clone)]
 pub(crate) struct BufferNode {
+    pub(crate) id: BufferId,
     pub(crate) size: u64,
 }
 
-// struct SubpassDesc {}
-
-// struct PassNode {
-//     groups: SmallVec<[PassFn<'n, B, T>; 4]>,
-// }
-
-pub(crate) enum PlanNodeData<'n, B: Backend, T: ?Sized> {
+pub(crate) enum PlanNode<'n, B: Backend, T: ?Sized> {
     /// Construction phase execution
     // Execution(NodeExecution<'a, B, T>),
     /// Construction phase resource
@@ -278,96 +349,347 @@ pub(crate) enum PlanNodeData<'n, B: Backend, T: ?Sized> {
     ClearImage(gfx_hal::command::ClearValue),
     /// Buffer clear operation
     ClearBuffer(u32),
+    /// Load image rendered in previous frame
+    LoadImage(NodeId, usize),
+    /// Store image for usage in next frame
+    StoreImage(NodeId, usize),
     UndefinedImage,
     UndefinedBuffer,
     /// A subpass that might have multiple render groups.
     RenderSubpass(SmallVec<[PassFn<'n, B, T>; 4]>),
-    // RenderPass(SmallVec<[PassFn<'n, B, T>; 4]>),
-    /// A node representing arbitrary runnable operation. All Op nodes are eventually lowered into it.
+    /// A render pass - group of subpasses with dependencies between them
+    RenderPass(RenderPassNode<'n, B, T>),
+    /// A node representing arbitrary runnable operation.
     Run(GeneralFn<'n, B, T>),
     /// Resolve multisampled image into non-multisampled one.
     /// Currently this works under asumption that all layers of source image are resolved into first layer of destination.
     ResolveImage,
-    /// Placeholder value required to take out the node out of graph just before replacing it
-    Tombstone,
     /// Graph root node. All incoming nodes are always evaluated.
     Root,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Attachment {
-    Input {
-        index: usize,
-        ops: gfx_hal::pass::AttachmentOps,
-    },
-    DepthStencil {
-        index: usize,
-        ops: gfx_hal::pass::AttachmentOps,
-        stecil_ops: gfx_hal::pass::AttachmentOps,
-    },
-    Color {
-        index: usize,
-        ops: gfx_hal::pass::AttachmentOps,
-    },
-    // TODO: Resolve attachments should be inferred from...
-    // - using multiple samples on non-msaa targets?
-    // - using SINGLE sample on msaa targets (resolve in subpass before)
-    // - using msaa on multisampling
-    Resolve {
-        index: usize,
-        ops: gfx_hal::pass::AttachmentOps,
-    },
-    // TODO: preserve attachments should be autoinferred based on subpass joining
-    Preserve,
+impl<'n, B: Backend, T: ?Sized> PlanNode<'n, B, T> {
+    #[inline(always)]
+    pub(crate) fn is_subpass(&self) -> bool {
+        match self {
+            Self::RenderSubpass(_) => true,
+            _ => false,
+        }
+    }
+    #[inline(always)]
+    pub(crate) fn is_pass(&self) -> bool {
+        match self {
+            Self::RenderPass(_) => true,
+            _ => false,
+        }
+    }
+
+    pub(crate) fn pass_mut(&mut self) -> Option<&mut RenderPassNode<'n, B, T>> {
+        match self {
+            Self::RenderPass(pass) => Some(pass),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AttachmentRefEdge {
+    Color(usize),
+    Input(usize),
+    DepthStencil(AttachmentAccess),
+    // resolve attachments are not added at build time, but later based on graph transformation
+    Resolve(usize),
+}
+
+impl AttachmentRefEdge {
+    #[inline]
+    pub(crate) fn is_write(&self) -> bool {
+        match self {
+            AttachmentRefEdge::Color(..) => true,
+            AttachmentRefEdge::Resolve(..) => true,
+            AttachmentRefEdge::Input(..) => false,
+            AttachmentRefEdge::DepthStencil(access) => access.is_write(),
+        }
+    }
+    #[inline]
+    pub(crate) fn layout(&self) -> gfx_hal::image::Layout {
+        match self {
+            AttachmentRefEdge::Color(..) => gfx_hal::image::Layout::ColorAttachmentOptimal,
+            AttachmentRefEdge::Resolve(..) => gfx_hal::image::Layout::ColorAttachmentOptimal,
+            AttachmentRefEdge::Input(..) => gfx_hal::image::Layout::ShaderReadOnlyOptimal,
+            AttachmentRefEdge::DepthStencil(access) => match access {
+                AttachmentAccess::ReadOnly => gfx_hal::image::Layout::DepthStencilReadOnlyOptimal,
+                AttachmentAccess::ReadWrite => {
+                    gfx_hal::image::Layout::DepthStencilAttachmentOptimal
+                }
+            },
+        }
+    }
+    #[inline]
+    pub(crate) fn accesses(&self) -> gfx_hal::image::Access {
+        match self {
+            AttachmentRefEdge::Color(..) => {
+                gfx_hal::image::Access::COLOR_ATTACHMENT_READ
+                    | gfx_hal::image::Access::COLOR_ATTACHMENT_WRITE
+            }
+            AttachmentRefEdge::Resolve(..) => gfx_hal::image::Access::COLOR_ATTACHMENT_WRITE,
+            AttachmentRefEdge::Input(..) => gfx_hal::image::Access::INPUT_ATTACHMENT_READ,
+            AttachmentRefEdge::DepthStencil(access) => match access {
+                AttachmentAccess::ReadOnly => gfx_hal::image::Access::DEPTH_STENCIL_ATTACHMENT_READ,
+                AttachmentAccess::ReadWrite => {
+                    gfx_hal::image::Access::DEPTH_STENCIL_ATTACHMENT_READ
+                        | gfx_hal::image::Access::DEPTH_STENCIL_ATTACHMENT_WRITE
+                }
+            },
+        }
+    }
+    #[inline]
+    pub(crate) fn stages(&self) -> gfx_hal::pso::PipelineStage {
+        match self {
+            // TODO: can it be declared if color is used as write-only?
+            AttachmentRefEdge::Color(..) => gfx_hal::pso::PipelineStage::COLOR_ATTACHMENT_OUTPUT,
+            AttachmentRefEdge::Resolve(..) => gfx_hal::pso::PipelineStage::COLOR_ATTACHMENT_OUTPUT,
+            AttachmentRefEdge::Input(..) => gfx_hal::pso::PipelineStage::FRAGMENT_SHADER,
+            AttachmentRefEdge::DepthStencil(_) => {
+                // TODO: can it be declared which fragment test is used?
+                gfx_hal::pso::PipelineStage::EARLY_FRAGMENT_TESTS
+                    | gfx_hal::pso::PipelineStage::LATE_FRAGMENT_TESTS
+            }
+        }
+    }
+}
+
+pub(crate) struct RenderPassSubpass<'n, B: Backend, T: ?Sized> {
+    pub(crate) groups: SmallVec<[PassFn<'n, B, T>; 4]>,
+    pub(crate) colors: SmallVec<[gfx_hal::pass::AttachmentRef; 8]>,
+    pub(crate) inputs: SmallVec<[gfx_hal::pass::AttachmentRef; 8]>,
+    pub(crate) resolves: SmallVec<[gfx_hal::pass::AttachmentRef; 4]>,
+    pub(crate) depth_stencil: gfx_hal::pass::AttachmentRef,
+}
+
+impl<'n, B: Backend, T: ?Sized> std::fmt::Debug for RenderPassSubpass<'n, B, T> {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fmt.debug_struct("RenderPassSubpass")
+            .field("groups", &self.groups.len())
+            .field("colors", &self.colors)
+            .field("inputs", &self.inputs)
+            .field("resolves", &self.resolves)
+            .field("depth_stencil", &self.depth_stencil)
+            .finish()
+    }
+}
+impl<'n, B: Backend, T: ?Sized> RenderPassSubpass<'n, B, T> {
+    pub(crate) fn new(groups: SmallVec<[PassFn<'n, B, T>; 4]>) -> Self {
+        Self {
+            groups,
+            colors: SmallVec::new(),
+            inputs: SmallVec::new(),
+            resolves: SmallVec::new(),
+            depth_stencil: (ATTACHMENT_UNUSED, gfx_hal::image::Layout::Undefined),
+        }
+    }
+    pub(crate) fn set_color(
+        &mut self,
+        ref_index: usize,
+        attachment_ref: gfx_hal::pass::AttachmentRef,
+    ) {
+        if self.colors.len() <= ref_index {
+            self.colors.resize(
+                ref_index + 1,
+                (ATTACHMENT_UNUSED, gfx_hal::image::Layout::Undefined),
+            );
+        }
+        self.colors[ref_index] = attachment_ref;
+    }
+    pub(crate) fn set_resolve(
+        &mut self,
+        ref_index: usize,
+        attachment_ref: gfx_hal::pass::AttachmentRef,
+    ) {
+        if self.resolves.len() <= ref_index {
+            self.resolves.resize(
+                ref_index + 1,
+                (ATTACHMENT_UNUSED, gfx_hal::image::Layout::Undefined),
+            );
+        }
+        self.colors[ref_index] = attachment_ref;
+    }
+    pub(crate) fn set_input(
+        &mut self,
+        ref_index: usize,
+        attachment_ref: gfx_hal::pass::AttachmentRef,
+    ) {
+        if self.inputs.len() <= ref_index {
+            self.inputs.resize(
+                ref_index + 1,
+                (ATTACHMENT_UNUSED, gfx_hal::image::Layout::Undefined),
+            );
+        }
+        self.inputs[ref_index] = attachment_ref;
+    }
+    pub(crate) fn set_depth_stencil(&mut self, attachment_ref: gfx_hal::pass::AttachmentRef) {
+        self.depth_stencil = attachment_ref;
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct RenderPassNode<'n, B: Backend, T: ?Sized> {
+    pub(crate) subpasses: SmallVec<[RenderPassSubpass<'n, B, T>; 4]>,
+    pub(crate) deps: SmallVec<[gfx_hal::pass::SubpassDependency; 32]>,
+}
+
+impl<'n, B: Backend, T: ?Sized> RenderPassNode<'n, B, T> {
+    pub(crate) fn new() -> Self {
+        Self {
+            subpasses: SmallVec::new(),
+            deps: SmallVec::new(),
+        }
+    }
+}
+
+// first_access/last_access is a way to approximate which subpasses need to preserve attachments.
+// It might have false positives, but this should preserve correctness and is better than nothing.
+
+// This is dogshit. Render pass doesn't have the "type" of attachment already figured out upfront.
+// Same thing can be a color and an input (or even a resolve) for two different subpasses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RenderPassAtachment {
+    pub(crate) ops: gfx_hal::pass::AttachmentOps,
+    pub(crate) stencil_ops: gfx_hal::pass::AttachmentOps,
+    pub(crate) clear: AttachmentClear,
+    pub(crate) first_access: u8,
+    pub(crate) last_access: u8,
+    pub(crate) first_write: Option<(u8, gfx_hal::pso::PipelineStage, gfx_hal::image::Access)>,
+    pub(crate) last_write: Option<(u8, gfx_hal::pso::PipelineStage, gfx_hal::image::Access)>,
+    pub(crate) queued_reads:
+        SmallVec<[(u8, gfx_hal::pso::PipelineStage, gfx_hal::image::Access); 4]>,
+    pub(crate) first_layout: gfx_hal::image::Layout,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AttachmentClear(pub(crate) Option<gfx_hal::command::ClearValue>);
+
+impl Eq for AttachmentClear {}
+impl PartialEq for AttachmentClear {
+    fn eq(&self, other: &AttachmentClear) -> bool {
+        match (self.0, other.0) {
+            (Some(clear_a), Some(clear_b)) => unsafe {
+                clear_a.color.uint32 == clear_b.color.uint32
+            },
+            (None, None) => true,
+            _ => false,
+        }
+    }
+}
+
+impl AttachmentRefEdge {
+    pub(crate) fn is_same_attachment(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Color(index_a), Self::Color(index_b)) => index_a == index_b,
+            (Self::Input(index_a), Self::Input(index_b)) => index_a == index_b,
+            (Self::DepthStencil(_), Self::DepthStencil(_)) => true,
+            _ => false,
+        }
+    }
+    pub(crate) fn merge(&mut self, other: &AttachmentRefEdge) {
+        match (self, other) {
+            (Self::DepthStencil(mut access_a), Self::DepthStencil(access_b)) => {
+                access_a.merge(access_b);
+            }
+            _ => {}
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum PlanEdge {
+    AttachmentRef(AttachmentRefEdge),
+    PassAttachment(RenderPassAtachment),
     /// Target node accesses connected source image version.
-    ImageAccess(NodeImageAccess, gfx_hal::pso::PipelineStage),
     BufferAccess(NodeBufferAccess, gfx_hal::pso::PipelineStage),
+    ImageAccess(NodeImageAccess, gfx_hal::pso::PipelineStage),
     /// A node-to-node execution order dependency
     Effect,
     /// Resource version relation. Version increases in the edge direction
     Version,
     /// Link between a resource and a node that is responsible for it's creation.
-    /// TODO: can this be just an effect?
     Origin,
 }
 
-impl<'n, B: Backend, T: ?Sized> std::fmt::Debug for PlanNodeData<'n, B, T> {
+impl<'n, B: Backend, T: ?Sized> std::fmt::Debug for PlanNode<'n, B, T> {
     fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PlanNodeData::Image(node) => fmt.debug_tuple("Image").field(node).finish(),
-            PlanNodeData::Buffer(node) => fmt.debug_tuple("Buffer").field(node).finish(),
-            PlanNodeData::ClearImage(c) => fmt.debug_tuple("ClearImage").field(c).finish(),
-            PlanNodeData::ClearBuffer(c) => fmt.debug_tuple("ClearBuffer").field(c).finish(),
-            PlanNodeData::ImageVersion => fmt.debug_tuple("ImageVersion").finish(),
-            PlanNodeData::BufferVersion => fmt.debug_tuple("BufferVersion").finish(),
-            PlanNodeData::UndefinedImage => fmt.debug_tuple("UndefinedImage").finish(),
-            PlanNodeData::UndefinedBuffer => fmt.debug_tuple("UndefinedBuffer").finish(),
-            PlanNodeData::RenderSubpass(vec) => fmt
+            PlanNode::Image(node) => fmt.debug_tuple("Image").field(node).finish(),
+            PlanNode::Buffer(node) => fmt.debug_tuple("Buffer").field(node).finish(),
+            PlanNode::LoadImage(i, c) => fmt.debug_tuple("LoadImage").field(i).field(c).finish(),
+            PlanNode::StoreImage(i, c) => fmt.debug_tuple("StoreImage").field(i).field(c).finish(),
+            PlanNode::ClearImage(c) => fmt.debug_tuple("ClearImage").field(c).finish(),
+            PlanNode::ClearBuffer(c) => fmt.debug_tuple("ClearBuffer").field(c).finish(),
+            PlanNode::ImageVersion => fmt.debug_tuple("ImageVersion").finish(),
+            PlanNode::BufferVersion => fmt.debug_tuple("BufferVersion").finish(),
+            PlanNode::UndefinedImage => fmt.debug_tuple("UndefinedImage").finish(),
+            PlanNode::UndefinedBuffer => fmt.debug_tuple("UndefinedBuffer").finish(),
+            PlanNode::RenderSubpass(vec) => fmt
                 .debug_tuple(&format!("RenderSubpass[{}]", vec.len()))
                 .finish(),
-            PlanNodeData::Run(_) => fmt.debug_tuple("Run").finish(),
-            PlanNodeData::ResolveImage => fmt.debug_tuple("ResolveImage").finish(),
-            PlanNodeData::Tombstone => fmt.debug_tuple("Tombstone").finish(),
-            PlanNodeData::Root => fmt.debug_tuple("Root").finish(),
+            PlanNode::RenderPass(pass_node) => {
+                fmt.write_str("RenderPass[")?;
+                for (i, subpass) in pass_node.subpasses.iter().enumerate() {
+                    if i != 0 {
+                        fmt.write_str(", ")?;
+                    }
+                    write!(fmt, "{}", subpass.groups.len())?;
+                }
+                fmt.write_str("]")?;
+                Ok(())
+            }
+            PlanNode::Run(_) => fmt.debug_tuple("Run").finish(),
+            PlanNode::ResolveImage => fmt.debug_tuple("ResolveImage").finish(),
+            PlanNode::Root => fmt.debug_tuple("Root").finish(),
         }
     }
 }
 
 impl PlanEdge {
-    pub(crate) fn is_attachment_only(&self) -> bool {
+    pub(crate) fn is_pass_attachment(&self) -> bool {
         match self {
-            PlanEdge::ImageAccess(usage, _) => usage.is_attachment_only(),
+            PlanEdge::PassAttachment(attachment) => true,
             _ => false,
         }
     }
-
-    pub(crate) fn is_attachment(&self) -> bool {
+    pub(crate) fn pass_attachment(&self) -> Option<&RenderPassAtachment> {
         match self {
-            PlanEdge::ImageAccess(usage, _) => usage.is_attachment(),
+            PlanEdge::PassAttachment(attachment) => Some(attachment),
+            _ => None,
+        }
+    }
+    pub(crate) fn pass_attachment_mut(&mut self) -> Option<&mut RenderPassAtachment> {
+        match self {
+            PlanEdge::PassAttachment(attachment) => Some(attachment),
+            _ => None,
+        }
+    }
+    pub(crate) fn is_attachment_ref(&self) -> bool {
+        match self {
+            PlanEdge::AttachmentRef(_) => true,
+            _ => false,
+        }
+    }
+    pub(crate) fn attachment_ref(&self) -> Option<&AttachmentRefEdge> {
+        match self {
+            PlanEdge::AttachmentRef(edge) => Some(edge),
+            _ => None,
+        }
+    }
+    pub(crate) fn is_version(&self) -> bool {
+        match self {
+            PlanEdge::Version => true,
+            _ => false,
+        }
+    }
+    pub(crate) fn is_origin(&self) -> bool {
+        match self {
+            PlanEdge::Origin => true,
             _ => false,
         }
     }
@@ -378,37 +700,31 @@ struct NodeSeed {
     resources: Range<usize>,
 }
 
-pub(crate) type PlanDag<'a, B, T> = graphy::Graph<'a, PlanNodeData<'a, B, T>, PlanEdge>;
+pub(crate) type PlanDag<'arena, B, T> = graphy::Graph<'arena, PlanNode<'arena, B, T>, PlanEdge>;
 
 #[derive(Debug)]
-pub struct PlanGraph<'a, B: Backend, T: ?Sized> {
-    dag: PlanDag<'a, B, T>,
-    alloc: &'a GraphAllocator,
-    images: Vec<ImageInfo>,
-    buffers: Vec<BufferInfo>,
-    processed_images: usize,
-    processed_buffers: usize,
+pub struct PlanGraph<'arena, B: Backend, T: ?Sized> {
+    dag: PlanDag<'arena, B, T>,
+    alloc: &'arena GraphAllocator,
     virtuals: usize,
     last_writes: HashMap<ResourceId, NodeIndex>,
     resource_usage: Vec<ResourceUsage>,
+    retained_images: HashMap<(NodeId, usize), Handle<Image<B>>>,
 }
 
-impl<'a, B: Backend, T: ?Sized> PlanGraph<'a, B, T> {
-    fn new(alloc: &'a GraphAllocator) -> Self {
+impl<'arena, B: Backend, T: ?Sized> PlanGraph<'arena, B, T> {
+    fn new(alloc: &'arena GraphAllocator) -> Self {
         let mut dag = PlanDag::new();
         // guaranteed to always be index 0
-        dag.insert_node(alloc, PlanNodeData::Root);
+        dag.insert_node(alloc, PlanNode::Root);
 
         Self {
             dag,
             alloc,
-            images: Vec::new(),
-            buffers: Vec::new(),
-            processed_images: 0,
-            processed_buffers: 0,
             virtuals: 0,
             last_writes: HashMap::new(),
             resource_usage: Vec::new(),
+            retained_images: HashMap::new(),
         }
     }
 
@@ -419,27 +735,77 @@ impl<'a, B: Backend, T: ?Sized> PlanGraph<'a, B, T> {
         }
     }
 
-    fn use_resource(&mut self, seed: &mut NodeSeed, usage: ResourceUsage) {
+    fn use_resource(
+        &mut self,
+        seed: &mut NodeSeed,
+        usage: ResourceUsage,
+    ) -> Result<(), NodeConstructionError> {
         if let Some(res) = self.resource_usage[seed.resources.clone()]
             .iter_mut()
             .find(|r| r.is_same_resource(&usage))
         {
-            res.merge_access(&usage);
+            res.merge_access(&usage)
         } else {
             self.resource_usage.push(usage);
             seed.resources.end += 1;
+            Ok(())
         }
     }
 
-    /// Create new image owned by graph.
-    pub(crate) fn create_image(&mut self, image_info: ImageInfo) -> ImageId {
-        self.images.push(image_info);
-        ImageId(self.processed_images + self.images.len() - 1)
+    /// Provide a node-managed resource to the graph.
+    pub(crate) fn provide_image(
+        &mut self,
+        source: NodeId,
+        info: ImageInfo,
+        handle: Handle<Image<B>>,
+    ) -> ImageId {
+        unimplemented!()
+    }
+
+    /// Create new image owned by graph. The image lifecycle is totally controlled by the graph.
+    pub(crate) fn create_image(&mut self, id: ImageId, info: ImageInfo) -> ImageId {
+        let def_data = PlanNode::Image(ImageNode {
+            id,
+            kind: info.kind,
+            levels: info.levels,
+            format: info.format,
+        });
+        let init_data = match info.load {
+            ImageLoad::DontCare => PlanNode::UndefinedImage,
+            ImageLoad::Clear(clear) => PlanNode::ClearImage(clear),
+            ImageLoad::Retain(index, clear) => {
+                if self.retained_images.contains_key(&(id.0, index)) {
+                    PlanNode::LoadImage(id.0, index)
+                } else {
+                    PlanNode::ClearImage(clear)
+                }
+            }
+        };
+        let def = self.dag.insert_node(self.alloc, def_data);
+        let (_, init) = self
+            .dag
+            .insert_child(self.alloc, def, PlanEdge::Origin, init_data);
+        self.last_writes.insert(ResourceId::Image(id), init);
+        id
     }
     /// Create new buffer owned by graph.
-    pub(crate) fn create_buffer(&mut self, buffer_info: BufferInfo) -> BufferId {
-        self.buffers.push(buffer_info);
-        BufferId(self.processed_buffers + self.buffers.len() - 1)
+    pub(crate) fn create_buffer(&mut self, id: BufferId, info: BufferInfo) -> BufferId {
+        let def_data = PlanNode::Buffer(BufferNode {
+            id,
+            size: info.size,
+        });
+        let init_data = if let Some(clear) = info.clear {
+            PlanNode::ClearBuffer(clear)
+        } else {
+            PlanNode::UndefinedBuffer
+        };
+
+        let def = self.dag.insert_node(self.alloc, def_data);
+        let (_, init) = self
+            .dag
+            .insert_child(self.alloc, def, PlanEdge::Origin, init_data);
+        self.last_writes.insert(ResourceId::Buffer(id), init);
+        id
     }
     /// Create non-data dependency target. A virtual resource intended to
     /// describe dependencies between rendering nodes without carrying any data.
@@ -448,7 +814,7 @@ impl<'a, B: Backend, T: ?Sized> PlanGraph<'a, B, T> {
         VirtualId(self.virtuals - 1)
     }
 
-    fn insert_node(&mut self, node: PlanNodeData<'a, B, T>) -> NodeIndex {
+    fn insert_node(&mut self, node: PlanNode<'arena, B, T>) -> NodeIndex {
         self.dag.insert_node(self.alloc, node)
     }
 
@@ -456,7 +822,7 @@ impl<'a, B: Backend, T: ?Sized> PlanGraph<'a, B, T> {
         &mut self,
         parent: NodeIndex,
         edge: PlanEdge,
-        node: PlanNodeData<'a, B, T>,
+        node: PlanNode<'arena, B, T>,
     ) -> NodeIndex {
         self.dag.insert_child(self.alloc, parent, edge, node).1
     }
@@ -478,71 +844,32 @@ impl<'a, B: Backend, T: ?Sized> PlanGraph<'a, B, T> {
         //     })
     }
 
-    fn process_resources(&mut self) {
-        for info in self.images.drain(..) {
-            let id = self.processed_images;
-            let init_data = if let Some(clear) = info.clear {
-                PlanNodeData::ClearImage(clear)
-            } else {
-                PlanNodeData::UndefinedImage
-            };
-
-            let def = self.dag.insert_node(
-                self.alloc,
-                PlanNodeData::Image(ImageNode {
-                    kind: info.kind,
-                    levels: info.levels,
-                    format: info.format,
-                }),
-            );
-            let (_, init) = self
-                .dag
-                .insert_child(self.alloc, def, PlanEdge::Origin, init_data);
-            self.last_writes
-                .insert(ResourceId::Image(ImageId(id)), init);
-            self.processed_images += 1;
-        }
-        for info in self.buffers.drain(..) {
-            let id = self.processed_buffers;
-            let init_data = if let Some(clear) = info.clear {
-                PlanNodeData::ClearBuffer(clear)
-            } else {
-                PlanNodeData::UndefinedBuffer
-            };
-
-            let def = self.dag.insert_node(
-                self.alloc,
-                PlanNodeData::Buffer(BufferNode { size: info.size }),
-            );
-            let (_, init) = self
-                .dag
-                .insert_child(self.alloc, def, PlanEdge::Origin, init_data);
-            self.last_writes
-                .insert(ResourceId::Image(ImageId(id)), init);
-            self.processed_buffers += 1;
-        }
-    }
-
-    fn insert(&mut self, seed: NodeSeed, exec: NodeExecution<'a, B, T>) {
+    fn insert(
+        &mut self,
+        seed: NodeSeed,
+        exec: NodeExecution<'arena, B, T>,
+    ) -> Result<(), NodeConstructionError> {
         // inserts should always happen in such order that resource usages are free to be drained
         debug_assert!(self.resource_usage.len() == seed.resources.end);
 
         // insert execution node
-        let node = match exec {
-            NodeExecution::RenderPass(group) => {
-                self.insert_node(PlanNodeData::RenderSubpass(smallvec![group]))
-            }
-            NodeExecution::General(run) => self.insert_node(PlanNodeData::Run(run)),
+        let (node, allow_attachments) = match exec {
+            NodeExecution::RenderPass(group) => (
+                self.insert_node(PlanNode::RenderSubpass(smallvec![group])),
+                true,
+            ),
+            NodeExecution::General(run) => (self.insert_node(PlanNode::Run(run)), false),
             NodeExecution::Output(run) => {
-                let node = self.insert_node(PlanNodeData::Run(run));
+                let node = self.insert_node(PlanNode::Run(run));
                 self.insert_edge(node, NodeIndex::new(0), PlanEdge::Effect);
-                node
+                (node, false)
             }
-            NodeExecution::None => return,
+            NodeExecution::None => {
+                // ignore resource access declared in this construction
+                self.resource_usage.truncate(seed.resources.start);
+                return Ok(());
+            }
         };
-
-        // process resources created up to this point
-        self.process_resources();
 
         // insert resource reads and writes
         for res in self.resource_usage.drain(seed.resources) {
@@ -567,8 +894,16 @@ impl<'a, B: Backend, T: ?Sized> PlanGraph<'a, B, T> {
                                 self.alloc,
                                 node,
                                 PlanEdge::Origin,
-                                PlanNodeData::ImageVersion,
+                                PlanNode::ImageVersion,
                             );
+                            self.dag
+                                .insert_edge_unchecked(
+                                    self.alloc,
+                                    last_version,
+                                    version,
+                                    PlanEdge::Version,
+                                )
+                                .unwrap();
                             self.last_writes.insert(ResourceId::Image(id), version);
                         }
                     }
@@ -593,8 +928,16 @@ impl<'a, B: Backend, T: ?Sized> PlanGraph<'a, B, T> {
                                 self.alloc,
                                 node,
                                 PlanEdge::Origin,
-                                PlanNodeData::BufferVersion,
+                                PlanNode::BufferVersion,
                             );
+                            self.dag
+                                .insert_edge_unchecked(
+                                    self.alloc,
+                                    last_version,
+                                    version,
+                                    PlanEdge::Version,
+                                )
+                                .unwrap();
                             self.last_writes.insert(ResourceId::Buffer(id), version);
                         }
                     }
@@ -611,34 +954,111 @@ impl<'a, B: Backend, T: ?Sized> PlanGraph<'a, B, T> {
                         self.last_writes.insert(ResourceId::Virtual(id), node);
                     }
                 }
+                ResourceUsage::ColorAttachment(id, index) => {
+                    if !allow_attachments {
+                        continue;
+                    }
+                    let last_version = self
+                        .last_writes
+                        .get(&ResourceId::Image(id))
+                        .copied()
+                        .expect("Accessing unproceessed image");
+                    self.dag
+                        .insert_edge_unchecked(
+                            self.alloc,
+                            last_version,
+                            node,
+                            PlanEdge::AttachmentRef(AttachmentRefEdge::Color(index)),
+                        )
+                        .unwrap();
+                    let (_, version) = self.dag.insert_child(
+                        self.alloc,
+                        node,
+                        PlanEdge::Origin,
+                        PlanNode::ImageVersion,
+                    );
+                    self.dag
+                        .insert_edge_unchecked(self.alloc, last_version, version, PlanEdge::Version)
+                        .unwrap();
+                    self.last_writes.insert(ResourceId::Image(id), version);
+                }
+                ResourceUsage::InputAttachment(id, index) => {
+                    if !allow_attachments {
+                        continue;
+                    }
+                    let last_version = self
+                        .last_writes
+                        .get(&ResourceId::Image(id))
+                        .copied()
+                        .expect("Accessing unproceessed image");
+                    self.dag
+                        .insert_edge_unchecked(
+                            self.alloc,
+                            last_version,
+                            node,
+                            PlanEdge::AttachmentRef(AttachmentRefEdge::Input(index)),
+                        )
+                        .unwrap();
+                }
+                ResourceUsage::DepthAttachment(id, access) => {
+                    if !allow_attachments {
+                        continue;
+                    }
+                    let last_version = self
+                        .last_writes
+                        .get(&ResourceId::Image(id))
+                        .copied()
+                        .expect("Accessing unproceessed image");
+                    self.dag
+                        .insert_edge_unchecked(
+                            self.alloc,
+                            last_version,
+                            node,
+                            PlanEdge::AttachmentRef(AttachmentRefEdge::DepthStencil(access)),
+                        )
+                        .unwrap();
+                    if access == AttachmentAccess::ReadWrite {
+                        let (_, version) = self.dag.insert_child(
+                            self.alloc,
+                            node,
+                            PlanEdge::Origin,
+                            PlanNode::ImageVersion,
+                        );
+                        self.dag
+                            .insert_edge_unchecked(
+                                self.alloc,
+                                last_version,
+                                version,
+                                PlanEdge::Version,
+                            )
+                            .unwrap();
+                        self.last_writes.insert(ResourceId::Image(id), version);
+                    }
+                }
             }
         }
+        Ok(())
     }
 }
 
 #[derive(Debug)]
-pub(crate) struct RunContext<'a, B: Backend, T: ?Sized> {
-    pub(crate) factory: &'a Factory<B>,
-    pub(crate) families: &'a Families<B>,
-    // images: Vec<ImageInfo>,
-    // buffers: Vec<BufferInfo>,
-    // virtuals: usize,
+pub(crate) struct RunContext<'arena, B: Backend, T: ?Sized> {
+    // not really 'arena, but has to live at least as long, so it's fine
+    pub(crate) factory: &'arena Factory<B>,
+    pub(crate) families: &'arena Families<B>,
     pub(crate) output_store: OutputStore,
-    graph: PlanGraph<'a, B, T>,
+    graph: PlanGraph<'arena, B, T>,
 }
 
-impl<'a, B: Backend, T: ?Sized> RunContext<'a, B, T> {
+impl<'arena, B: Backend, T: ?Sized> RunContext<'arena, B, T> {
     pub(crate) fn new(
-        factory: &'a Factory<B>,
-        families: &'a Families<B>,
-        allocator: &'a GraphAllocator,
+        factory: &'arena Factory<B>,
+        families: &'arena Families<B>,
+        allocator: &'arena GraphAllocator,
     ) -> Self {
         Self {
             factory,
             families,
-            // images: Vec::new(),
-            // buffers: Vec::new(),
-            // virtuals: 0,
             output_store: OutputStore::new(),
             graph: PlanGraph::new(allocator),
         }
@@ -729,10 +1149,10 @@ mod test {
             _: &(),
         ) -> Result<((), NodeExecution<'_, TestBackend, ()>), NodeConstructionError> {
             let color = *ctx.get_parameter(self.color)?;
-            ctx.use_image(color, ImageUsage::ColorAttachmentWrite);
+            ctx.use_color(0, color)?;
             if let Some(depth) = self.depth {
                 let depth = *ctx.get_parameter(depth)?;
-                ctx.use_image(depth, ImageUsage::DepthStencilAttachmentWrite);
+                ctx.use_depth(depth, true)?;
             }
 
             Ok(((), NodeExecution::pass(|_, _| Ok(()))))
@@ -741,15 +1161,15 @@ mod test {
 
     #[derive(Debug)]
     struct TestPass2 {
-        color1: Parameter<ImageId>,
-        color2: Parameter<ImageId>,
+        color1: Option<Parameter<ImageId>>,
+        color2: Option<Parameter<ImageId>>,
         depth: Option<Parameter<ImageId>>,
     }
 
     impl TestPass2 {
         fn new(
-            color1: Parameter<ImageId>,
-            color2: Parameter<ImageId>,
+            color1: Option<Parameter<ImageId>>,
+            color2: Option<Parameter<ImageId>>,
             depth: Option<Parameter<ImageId>>,
         ) -> Self {
             Self {
@@ -781,13 +1201,116 @@ mod test {
             ctx: &mut NodeContext<TestBackend, ()>,
             _: &(),
         ) -> Result<((), NodeExecution<'_, TestBackend, ()>), NodeConstructionError> {
-            let color1 = *ctx.get_parameter(self.color1)?;
-            let color2 = *ctx.get_parameter(self.color2)?;
-            ctx.use_image(color1, ImageUsage::ColorAttachmentWrite);
-            ctx.use_image(color2, ImageUsage::ColorAttachmentRead);
+            if let Some(color1) = self.color1 {
+                let color1 = *ctx.get_parameter(color1)?;
+                ctx.use_color(0, color1)?;
+            }
+            if let Some(color2) = self.color2 {
+                let color2 = *ctx.get_parameter(color2)?;
+                ctx.use_input(0, color2)?;
+            }
             if let Some(depth) = self.depth {
                 let depth = *ctx.get_parameter(depth)?;
-                ctx.use_image(depth, ImageUsage::DepthStencilAttachmentRead);
+                ctx.use_depth(depth, false)?;
+            }
+
+            Ok(((), NodeExecution::pass(|_, _| Ok(()))))
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestCompute1 {
+        color: Option<Parameter<ImageId>>,
+    }
+
+    impl TestCompute1 {
+        fn new(color: Option<Parameter<ImageId>>) -> Self {
+            Self { color }
+        }
+    }
+
+    impl NodeBuilder<TestBackend, ()> for TestCompute1 {
+        type Node = Self;
+        type Family = crate::command::Graphics;
+        fn build(
+            self: Box<Self>,
+            _: &mut Factory<TestBackend>,
+            _: &mut Family<TestBackend>,
+            _: &(),
+        ) -> Result<Self::Node, NodeBuildError> {
+            Ok(*self)
+        }
+    }
+
+    impl Node<TestBackend, ()> for TestCompute1 {
+        type Outputs = Parameter<BufferId>;
+
+        fn construct(
+            &mut self,
+            ctx: &mut NodeContext<TestBackend, ()>,
+            _: &(),
+        ) -> Result<(BufferId, NodeExecution<'_, TestBackend, ()>), NodeConstructionError> {
+            let buf_id = ctx.create_buffer(BufferInfo {
+                size: 1,
+                clear: None,
+            });
+            ctx.use_buffer(buf_id, BufferUsage::StorageWrite(ShaderUsage::COMPUTE))?;
+
+            if let Some(color) = self.color {
+                let color = *ctx.get_parameter(color)?;
+                ctx.use_color(0, color)?;
+            }
+
+            Ok((buf_id, NodeExecution::pass(|_, _| Ok(()))))
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestPass3 {
+        color: Parameter<ImageId>,
+        buffer: Parameter<BufferId>,
+        write_buffer: bool,
+    }
+
+    impl TestPass3 {
+        fn new(color: Parameter<ImageId>, buffer: Parameter<BufferId>, write_buffer: bool) -> Self {
+            Self {
+                color,
+                buffer,
+                write_buffer,
+            }
+        }
+    }
+
+    impl NodeBuilder<TestBackend, ()> for TestPass3 {
+        type Node = Self;
+        type Family = crate::command::Graphics;
+        fn build(
+            self: Box<Self>,
+            _: &mut Factory<TestBackend>,
+            _: &mut Family<TestBackend>,
+            _: &(),
+        ) -> Result<Self::Node, NodeBuildError> {
+            Ok(*self)
+        }
+    }
+
+    impl Node<TestBackend, ()> for TestPass3 {
+        type Outputs = ();
+
+        fn construct(
+            &mut self,
+            ctx: &mut NodeContext<TestBackend, ()>,
+            _: &(),
+        ) -> Result<((), NodeExecution<'_, TestBackend, ()>), NodeConstructionError> {
+            let color = *ctx.get_parameter(self.color)?;
+            let buffer = *ctx.get_parameter(self.buffer)?;
+
+            ctx.use_color(0, color)?;
+            if self.write_buffer {
+                ctx.use_buffer(buffer, BufferUsage::StorageWrite(ShaderUsage::FRAGMENT))?;
+            } else {
+                ctx.use_buffer(buffer, BufferUsage::StorageRead(ShaderUsage::FRAGMENT))?;
             }
 
             Ok(((), NodeExecution::pass(|_, _| Ok(()))))
@@ -821,9 +1344,9 @@ mod test {
                 kind: gfx_hal::image::Kind::D2(1024, 1024, 1, 1),
                 levels: 1,
                 format: gfx_hal::format::Format::Rgba8Unorm,
-                clear: None,
+                load: ImageLoad::DontCare,
             });
-            ctx.use_image(output, ImageUsage::ColorAttachmentRead);
+            ctx.use_image(output, ImageUsage::ColorAttachmentRead)?;
             Ok((output, NodeExecution::output(|_, _| Ok(()))))
         }
     }
@@ -831,7 +1354,6 @@ mod test {
     #[test]
     fn test_construction() {
         test_init();
-        let mut file = std::fs::File::create("graph.dot").unwrap();
 
         let config: crate::factory::Config = Default::default();
         let (mut factory, mut families): (Factory<TestBackend>, _) =
@@ -843,7 +1365,7 @@ mod test {
             kind: gfx_hal::image::Kind::D2(1, 1, 1, 1),
             levels: 1,
             format: gfx_hal::format::Format::R32Sfloat,
-            clear: Some(gfx_hal::command::ClearValue {
+            load: ImageLoad::Clear(gfx_hal::command::ClearValue {
                 depth_stencil: gfx_hal::command::ClearDepthStencil {
                     depth: 0.0,
                     stencil: 0,
@@ -854,33 +1376,43 @@ mod test {
             kind: gfx_hal::image::Kind::D2(1, 1, 1, 1),
             levels: 1,
             format: gfx_hal::format::Format::R32Sfloat,
-            clear: None,
+            load: ImageLoad::DontCare,
         });
         let color2 = builder.add(ImageInfo {
             kind: gfx_hal::image::Kind::D2(1, 1, 1, 1),
             levels: 1,
             format: gfx_hal::format::Format::Rgba8Unorm,
-            clear: None,
+            load: ImageLoad::DontCare,
         });
         let color = builder.add(TestOutput);
+        builder.add(TestPass2::new(Some(color2), None, None));
+        builder.add(TestPass2::new(Some(color), Some(color2), None));
         builder.add(TestPass::new(color, Some(depth)));
+        let buf1 = builder.add(TestCompute1::new(Some(color)));
         builder.add(TestPass::new(color2, Some(depth2)));
-        builder.add(TestPass::new(color, Some(depth)));
-        builder.add(TestPass::new(color2, Some(depth2)));
-        builder.add(TestPass2::new(color2, color, None));
-        builder.add(TestPass2::new(color, color2, Some(depth2)));
-        builder.add(TestPass2::new(color, color2, Some(depth2)));
-        builder.add(TestPass::new(color, Some(depth)));
+        builder.add(TestPass3::new(color, buf1, false));
+        builder.add(TestPass3::new(color, buf1, true));
+        builder.add(TestPass2::new(Some(color2), Some(color), None));
+        builder.add(TestPass2::new(Some(color), Some(color2), None));
+        builder.add(TestPass2::new(Some(color), Some(color2), Some(depth2)));
         builder.add(TestPass::new(color, Some(depth)));
         builder.add(TestPass::new(color, None));
 
-        let mut graph = builder.build(&mut factory, &mut families, &()).unwrap();
+        builder.add(TestPass2::new(Some(color2), None, None));
+        builder.add(TestPass2::new(Some(color), Some(color2), None));
+        builder.add(TestPass::new(color, None));
 
+        let mut graph = builder.build(&mut factory, &mut families, &()).unwrap();
+        unsafe {
+            graph.alloc.reset();
+        }
         let mut run_ctx = RunContext::new(&factory, &families, &graph.alloc);
         graph
             .nodes
             .run_construction_phase(&mut run_ctx, &())
             .unwrap();
+
+        let mut file = std::fs::File::create("graph.dot").unwrap();
         visualize_graph(&mut file, &run_ctx.graph.dag, "raw");
         graph.pipeline.reduce(&mut run_ctx.graph.dag, &graph.alloc);
         visualize_graph(&mut file, &run_ctx.graph.dag, "opti");

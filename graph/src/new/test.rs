@@ -59,7 +59,7 @@ macro_rules! graph {
 
         ([$alloc:expr], $($tail:tt)*) => {{
             let mut graph = $crate::new::graph::PlanDag::<$crate::new::test::TestBackend, ()>::new();
-            graph.insert_node($alloc, PlanNodeData::Root);
+            graph.insert_node($alloc, PlanNode::Root);
             graph_decl!(@decl [graph, $alloc], $($tail)*);
             graph
         }};
@@ -116,7 +116,7 @@ pub(crate) fn visualize_graph<B: gfx_hal::Backend, T: ?Sized>(
     graph: &PlanDag<B, T>,
     name: &str,
 ) {
-    use crate::new::graph::{PlanEdge, PlanNodeData};
+    use crate::new::graph::{PlanEdge, PlanNode};
     use graphy::{EdgeIndex, NodeIndex};
 
     struct Visualize<'a, 'b, B: gfx_hal::Backend, T: ?Sized>(&'b PlanDag<'a, B, T>, String);
@@ -126,40 +126,66 @@ pub(crate) fn visualize_graph<B: gfx_hal::Backend, T: ?Sized>(
             match self.0.get_edge(index).unwrap() {
                 PlanEdge::Effect => "#ff615d",
                 PlanEdge::Origin => "#ff950f",
+                PlanEdge::Version => "#ff250f",
                 PlanEdge::ImageAccess(_, _) => "#aaaaff",
-                PlanEdge::BufferAccess(_, _) => "#aaffaa",
-                _ => "#aaaaaa",
+                PlanEdge::BufferAccess(_, _) => "#550000",
+                PlanEdge::AttachmentRef(_) => "#44aa99",
+                PlanEdge::PassAttachment(_) => "#44aa99",
+                // _ => "#aaaaaa",
             }
         }
         fn node_color(&self, index: NodeIndex) -> &'static str {
             match self.0.get_node(index).unwrap() {
-                PlanNodeData::Root => "#99aaff",
-                PlanNodeData::Image { .. } => "#0000ff",
-                PlanNodeData::ImageVersion => "#2266ff",
-                PlanNodeData::UndefinedImage => "#2266ff",
-                PlanNodeData::ClearImage(_) => "#2266ff",
-                PlanNodeData::RenderSubpass(_) => "#03c03c",
-                PlanNodeData::Run(_) => "#9b03c0",
+                PlanNode::Root => "#99aaff",
+                PlanNode::Image { .. } => "#0000ff",
+                PlanNode::ImageVersion => "#2266ff",
+                PlanNode::UndefinedImage => "#2266ff",
+                PlanNode::ClearImage(_) => "#2266ff",
+                PlanNode::BufferVersion => "#330000",
+                PlanNode::UndefinedBuffer => "#330000",
+                PlanNode::ClearBuffer(_) => "#330000",
+                PlanNode::RenderSubpass(_) => "#03c03c",
+                PlanNode::RenderPass(_) => "#03c03c",
+                PlanNode::Run(_) => "#9b03c0",
                 _ => "black",
             }
         }
-        fn node_label(&self, node: &PlanNodeData<'a, B, T>) -> String {
-            match node {
-                PlanNodeData::Root => format!("<font color=\"white\">{}</font>", self.1),
-                PlanNodeData::Image(im) => format!("<table border='0' cellborder='1' cellspacing='0'><tr><td><b>Image</b></td></tr><tr><td>{:?}</td></tr><tr><td>{:?}, levels: {:?}</td></tr></table>", im.kind, im.format, im.levels),
-                PlanNodeData::ClearImage(c) => format!(
-                    "<table border='0' cellborder='1' cellspacing='0'><tr><td><b>ClearImage</b></td></tr><tr><td>color: {:?}</td></tr><tr><td>depth: {:?}, stencil: {:?}</td></tr></table>",
+        fn node_label(&self, index: NodeIndex) -> String {
+            match self.0.get_node(index).unwrap() {
+                PlanNode::Root => format!("<font color=\"white\">{}</font>", self.1),
+                PlanNode::Image(im) => format!(
+                    "<table border='0' cellborder='1' cellspacing='0'><tr><td><b>{}: Image N{}[{}]</b></td></tr><tr><td>{:?}</td></tr><tr><td>{:?}, levels: {:?}</td></tr></table>",
+                    index.index(),
+                    im.id.0 .0,
+                    im.id.1,
+                    im.kind,
+                    im.format,
+                    im.levels,
+                ),
+                PlanNode::Buffer(buf) => format!("{}: Buffer N{}[{}]",
+                    index.index(),
+                    buf.id.0 .0,
+                    buf.id.1,
+                ),
+                PlanNode::ClearImage(c) => format!(
+                    "<table border='0' cellborder='1' cellspacing='0'><tr><td><b>{}: ClearImage</b></td></tr><tr><td>color: {:?}</td></tr><tr><td>depth: {:?}, stencil: {:?}</td></tr></table>",
+                    index.index(),
                     unsafe { c.color.uint32 },
                     unsafe { c.depth_stencil.depth },
                     unsafe { c.depth_stencil.stencil },
                 ),
-                n => format!("{:?}", n),
+                PlanNode::LoadImage(node, load_index) => format!("{}: LoadImage ({}, {})", index.index(), node.0, load_index),
+                PlanNode::StoreImage(node, load_index) => format!("{}: StoreImage ({}, {})", index.index(), node.0, load_index),
+                p @ PlanNode::RenderPass(..) => format!("{}: {:?}", index.index(), p),
+                n => format!("{}: {:?}", index.index(), n),
             }
         }
-        fn edge_label(&self, edge: &PlanEdge) -> String {
-            match edge {
+        fn edge_label(&self, index: EdgeIndex) -> String {
+            match self.0.get_edge(index).unwrap() {
                 PlanEdge::ImageAccess(a, s) => format!("<table border='0' cellborder='1' cellspacing='0'><tr><td><b>ImageAccess</b></td></tr><tr><td>{:?}</td></tr><tr><td>{:?}</td></tr></table>", a, s),
                 PlanEdge::BufferAccess(a, s) => format!("<table border='0' cellborder='1' cellspacing='0'><tr><td><b>BufferAccess</b></td></tr><tr><td>{:?}</td></tr><tr><td>{:?}</td></tr></table>", a, s),
+                PlanEdge::AttachmentRef(edge) => format!("{:?}", edge),
+                PlanEdge::PassAttachment(edge) => format!("{:?}", edge.first_layout),
                 e => format!("{:?}", e),
             }
         }
@@ -212,7 +238,7 @@ pub(crate) fn visualize_graph<B: gfx_hal::Backend, T: ?Sized>(
                         format!(
                             "<font color=\"{}\">{}</font>",
                             self.node_color(*n_id),
-                            self.node_label(n)
+                            self.node_label(*n_id),
                         )
                         .into(),
                     ),
@@ -221,7 +247,7 @@ pub(crate) fn visualize_graph<B: gfx_hal::Backend, T: ?Sized>(
                     format!(
                         "<font color=\"{}\">{}</font>",
                         self.edge_color(*e),
-                        self.edge_label(self.0.get_edge(*e).unwrap()),
+                        self.edge_label(*e),
                     )
                     .into(),
                 ),
@@ -236,9 +262,9 @@ pub(crate) fn visualize_graph<B: gfx_hal::Backend, T: ?Sized>(
         fn node_shape(&'b self, n: &Item) -> Option<dot::LabelText<'b>> {
             let shape = match n {
                 Item::Node(n) => match self.0.get_node(*n).unwrap() {
-                    PlanNodeData::Root => "circle",
-                    PlanNodeData::Image(_) => "plain",
-                    PlanNodeData::ClearImage(_) => "plain",
+                    PlanNode::Root => "circle",
+                    PlanNode::Image(_) => "plain",
+                    PlanNode::ClearImage(_) => "plain",
                     _ => "box",
                 },
                 Item::Edge(_) => "plain",
@@ -248,7 +274,7 @@ pub(crate) fn visualize_graph<B: gfx_hal::Backend, T: ?Sized>(
         fn node_style(&self, n: &Item) -> dot::Style {
             match n {
                 Item::Node(n) => match self.0.get_node(*n).unwrap() {
-                    PlanNodeData::Root => dot::Style::Filled,
+                    PlanNode::Root => dot::Style::Filled,
                     _ => dot::Style::Bold,
                 },
                 Item::Edge(_) => dot::Style::Rounded,
@@ -256,7 +282,8 @@ pub(crate) fn visualize_graph<B: gfx_hal::Backend, T: ?Sized>(
         }
         fn edge_style(&self, e: &Edge) -> dot::Style {
             match self.0.get_edge(e.edge()).unwrap() {
-                PlanEdge::Effect => dot::Style::Dotted,
+                PlanEdge::Effect => dot::Style::Dashed,
+                PlanEdge::Version => dot::Style::Dashed,
                 _ => dot::Style::Filled,
             }
         }

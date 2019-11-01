@@ -1,7 +1,7 @@
 use {
     super::{
         graph::NodeContext,
-        resources::{BufferId, ImageId},
+        resources::{BufferId, ImageId, ResourceUsage},
     },
     crate::{
         command::{Capability, Families, Family, FamilyId, Fence, Queue, Submission, Submittable},
@@ -222,6 +222,9 @@ pub enum NodeConstructionError {
     /// Node tried to read a variable that was never written to.
     /// This can only happen when node that produces this variable have failed to construct.
     VariableReadFailed(ParameterId),
+    /// Tried to declare usage of a resource in invalid way, e.g. single image was used
+    /// as two attachments.
+    InvalidResourceUsage(ResourceUsage, ResourceUsage),
 }
 
 #[derive(Debug, Clone, Copy)]

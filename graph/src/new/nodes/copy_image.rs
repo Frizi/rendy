@@ -80,8 +80,8 @@ impl<B: Backend, T: ?Sized> Node<B, T> for CopyImage<B> {
         let src_id = *ctx.get_parameter(self.src)?;
         let dst_id = *ctx.get_parameter(self.dst)?;
 
-        ctx.use_image(src_id, ImageUsage::TransferRead);
-        ctx.use_image(dst_id, ImageUsage::TransferWrite);
+        ctx.use_image(src_id, ImageUsage::TransferRead)?;
+        ctx.use_image(dst_id, ImageUsage::TransferWrite)?;
 
         let pool = &mut self.pool;
         let submit = &mut self.submit;

@@ -1,7 +1,7 @@
-use super::graph::{PlanDag, PlanEdge};
+use super::graph::{PlanDag, PlanEdge, PlanNode};
+use super::pipeline::Contributions;
 use gfx_hal::Backend;
 use graphy::{Direction, EdgeIndex, GraphAllocator, GraphError, NodeIndex, Walker};
-
 #[derive(Debug)]
 pub enum Reduction {
     /// Reduction have no effect
@@ -10,6 +10,18 @@ pub enum Reduction {
     Changed,
     /// Signal that current node was replaced by other node
     Replace(NodeIndex),
+}
+
+// This is unfortunately coupled to the pipeline implementation. Ideally it would be a generic
+// type over reducer, but associated lifetime makes that super hard. So instead this shortcut is used.
+pub(crate) struct ReductionContext<'a> {
+    pub(crate) contributions: Contributions<'a>,
+}
+
+impl<'a> ReductionContext<'a> {
+    pub(crate) fn new(contributions: Contributions<'a>) -> Self {
+        Self { contributions }
+    }
 }
 
 /// A reducer can reduce or simplify a given node based on its operator and inputs.
@@ -164,11 +176,12 @@ impl ReductionState {
         }
     }
 
-    fn reduce<'a, B: Backend, T: ?Sized>(
+    fn reduce<'arena, B: Backend, T: ?Sized>(
         &mut self,
         reducers: &mut Reducers<B, T>,
-        graph: &mut PlanDag<'a, B, T>,
-        alloc: &'a GraphAllocator,
+        graph: &mut PlanDag<'arena, B, T>,
+        context: &ReductionContext<'arena>,
+        alloc: &'arena GraphAllocator,
         node: NodeIndex,
     ) -> Reduction {
         let mut skip = reducers.len();
@@ -186,6 +199,7 @@ impl ReductionState {
                 state: self,
                 graph,
                 alloc,
+                context,
             };
             let reduction: Reduction = reducers[i].reduce(&mut editor, node);
             match reduction {
@@ -223,11 +237,12 @@ impl ReductionState {
         return Reduction::Changed;
     }
 
-    fn reduce_node<'a, B: Backend, T: ?Sized>(
+    fn reduce_node<'arena, B: Backend, T: ?Sized>(
         &mut self,
         reducers: &mut Reducers<B, T>,
-        graph: &mut PlanDag<'a, B, T>,
-        alloc: &'a GraphAllocator,
+        graph: &mut PlanDag<'arena, B, T>,
+        context: &ReductionContext<'arena>,
+        alloc: &'arena GraphAllocator,
         node: NodeIndex,
     ) {
         debug_assert!(self.stack.is_empty());
@@ -240,7 +255,7 @@ impl ReductionState {
             if !self.stack.is_empty() {
                 // Process the node on the top of the stack, potentially pushing more or
                 // popping the node off the stack.
-                self.reduce_top(reducers, graph, alloc);
+                self.reduce_top(reducers, graph, context, alloc);
             } else if let Some(node) = self.revisit.pop() {
                 // If the stack becomes empty, revisit any nodes in the revisit queue.
                 if self.state(node) == State::Revisit {
@@ -253,6 +268,7 @@ impl ReductionState {
                     state: self,
                     graph,
                     alloc,
+                    context,
                 };
                 for reducer in reducers.iter_mut() {
                     reducer.finalize(&mut editor);
@@ -309,11 +325,12 @@ impl ReductionState {
         return false;
     }
 
-    fn reduce_top<'a, B: Backend, T: ?Sized>(
+    fn reduce_top<'arena, B: Backend, T: ?Sized>(
         &mut self,
         reducers: &mut Reducers<B, T>,
-        graph: &mut PlanDag<'a, B, T>,
-        alloc: &'a GraphAllocator,
+        graph: &mut PlanDag<'arena, B, T>,
+        context: &ReductionContext<'arena>,
+        alloc: &'arena GraphAllocator,
     ) {
         let node = self.stack.last().unwrap().node;
 
@@ -321,7 +338,7 @@ impl ReductionState {
             return self.pop(); // Node was killed while on stack.
         }
 
-        log::trace!("Reduce top [{}]: {:?}", node.index(), graph.get_node(node));
+        // log::trace!("Reduce top [{}]: {:?}", node.index(), graph.get_node(node));
 
         debug_assert_eq!(State::OnStack, self.state(node));
 
@@ -334,7 +351,7 @@ impl ReductionState {
         let max_id = NodeIndex::new(graph.node_count() - 1);
 
         // All inputs should be visited or on stack. Apply reductions to node.
-        match self.reduce(reducers, graph, alloc, node) {
+        match self.reduce(reducers, graph, context, alloc, node) {
             Reduction::NoChange => {
                 // If there was no reduction, pop {node} and continue.
                 self.pop();
@@ -363,38 +380,55 @@ impl ReductionState {
     }
 }
 
-pub(crate) struct GraphEditor<'a, 'b: 'a, B: Backend, T: ?Sized> {
+pub(crate) struct GraphEditor<'a, 'arena: 'a, B: Backend, T: ?Sized> {
     state: &'a mut ReductionState,
-    graph: &'a mut PlanDag<'b, B, T>,
-    alloc: &'b GraphAllocator,
+    graph: &'a mut PlanDag<'arena, B, T>,
+    context: &'a ReductionContext<'arena>,
+    alloc: &'arena GraphAllocator,
 }
 
-impl<'a, 'b: 'a, B: Backend, T: ?Sized> GraphEditor<'a, 'b, B, T> {
-    pub(crate) fn graph(&self) -> &PlanDag<'b, B, T> {
+impl<'a, 'arena: 'a, B: Backend, T: ?Sized> GraphEditor<'a, 'arena, B, T> {
+    #[inline(always)]
+    pub(crate) fn graph(&self) -> &PlanDag<'arena, B, T> {
         self.graph
     }
 
-    pub(crate) fn graph_mut(&mut self) -> &mut PlanDag<'b, B, T> {
+    #[inline(always)]
+    pub(crate) fn graph_mut(&mut self) -> &mut PlanDag<'arena, B, T> {
         self.graph
     }
 
+    pub(crate) fn context(&self) -> &ReductionContext<'arena> {
+        &self.context
+    }
+
+    #[inline(always)]
     pub(crate) fn replace(&mut self, node: NodeIndex, replacement: NodeIndex) {
         self.state
             .replace(self.graph, node, replacement, NodeIndex::end());
     }
 
+    #[inline(always)]
     pub(crate) fn revisit(&mut self, node: NodeIndex) {
         self.state.revisit(node);
     }
 
+    #[inline(always)]
     pub(crate) fn kill(&mut self, node: NodeIndex) {
         self.state.kill(node);
     }
 
+    #[inline(always)]
     pub(crate) fn is_dead(&self, node: NodeIndex) -> bool {
         self.state.is_dead(node)
     }
 
+    #[inline(always)]
+    pub(crate) fn insert_node(&mut self, node: PlanNode<'arena, B, T>) -> NodeIndex {
+        self.graph.insert_node(self.alloc, node)
+    }
+
+    #[inline(always)]
     pub(crate) fn insert_edge_unchecked(
         &mut self,
         from: NodeIndex,
@@ -426,12 +460,13 @@ impl<B: Backend, T: ?Sized> GraphReducer<B, T> {
         self
     }
 
-    pub(crate) fn reduce_graph<'a>(
+    pub(crate) fn reduce_graph<'arena>(
         &mut self,
-        graph: &mut PlanDag<'a, B, T>,
-        alloc: &'a GraphAllocator,
+        graph: &mut PlanDag<'arena, B, T>,
+        context: &ReductionContext<'arena>,
+        alloc: &'arena GraphAllocator,
     ) {
         self.state
-            .reduce_node(&mut self.reducers, graph, alloc, NodeIndex::new(0))
+            .reduce_node(&mut self.reducers, graph, context, alloc, NodeIndex::new(0))
     }
 }

@@ -1,24 +1,39 @@
+use super::node::NodeId;
+use crate::new::node::NodeConstructionError;
 use bitflags::bitflags;
 use gfx_hal::pso::PipelineStage;
 
 /// Id of the buffer in graph.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct BufferId(pub(super) usize);
+pub struct BufferId(pub(super) NodeId, pub(super) usize);
 
 /// Id of the image (or swapchain) in graph.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ImageId(pub(super) usize);
+pub struct ImageId(pub(super) NodeId, pub(super) usize);
 
 /// Id of virtual resource in graph.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct VirtualId(pub(super) usize);
 
 #[derive(Debug, Clone, Copy)]
+pub enum ImageLoad {
+    /// Image contents left undefined. The fastest option when you expect to overwrite it all anyway.
+    DontCare,
+    /// Use image contents generated in previous frame.
+    /// When the image is used for the first time in a series of frames, the clear operation is used instead.
+    /// Specify a node-scoped stable unique identifier to link it with the contents from previous frame.
+    Retain(usize, gfx_hal::command::ClearValue),
+    /// Clear the image with specified value when using it for the first time in the render pipeline.
+    Clear(gfx_hal::command::ClearValue),
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct ImageInfo {
     pub kind: gfx_hal::image::Kind,
     pub levels: gfx_hal::image::Level,
     pub format: gfx_hal::format::Format,
-    pub clear: Option<gfx_hal::command::ClearValue>,
+    /// Specify how the image is being loaded when used for the first time in the frame
+    pub load: ImageLoad,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -90,16 +105,6 @@ impl NodeImageAccess {
                 | Self::TRANSFER_WRITE)
     }
 
-    pub fn is_attachment_only(&self) -> bool {
-        self.is_attachment()
-            && (Self::INPUT_ATTACHMENT_READ
-                | Self::COLOR_ATTACHMENT_READ
-                | Self::COLOR_ATTACHMENT_WRITE
-                | Self::DEPTH_STENCIL_ATTACHMENT_READ
-                | Self::DEPTH_STENCIL_ATTACHMENT_WRITE)
-                .contains(*self)
-    }
-
     pub fn is_attachment(&self) -> bool {
         self.intersects(
             Self::INPUT_ATTACHMENT_READ
@@ -155,11 +160,33 @@ pub enum ResourceId {
     Virtual(VirtualId),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ResourceUsage {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachmentAccess {
+    ReadOnly,
+    ReadWrite,
+}
+
+impl AttachmentAccess {
+    pub(crate) fn is_write(&self) -> bool {
+        *self == AttachmentAccess::ReadWrite
+    }
+    pub(crate) fn merge(&mut self, other: &AttachmentAccess) {
+        if *other == Self::ReadWrite {
+            *self = Self::ReadWrite;
+        }
+    }
+}
+
+/// A declaration of resource usage in a rendering node.
+/// Publicly used only for error reporitng.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceUsage {
     Image(ImageId, NodeImageAccess, PipelineStage),
     Buffer(BufferId, NodeBufferAccess, PipelineStage),
     Virtual(VirtualId, NodeVirtualAccess),
+    ColorAttachment(ImageId, usize),
+    InputAttachment(ImageId, usize),
+    DepthAttachment(ImageId, AttachmentAccess),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,15 +197,28 @@ pub(crate) enum ResourceAccess {
 }
 
 impl ResourceUsage {
-    pub(crate) fn is_same_resource(&self, usage: &ResourceUsage) -> bool {
-        match (self, usage) {
-            (Self::Image(a, _, _), Self::Image(b, _, _)) if a == b => true,
-            (Self::Buffer(a, _, _), Self::Buffer(b, _, _)) if a == b => true,
-            (Self::Virtual(a, _), Self::Virtual(b, _)) if a == b => true,
-            _ => false,
+    fn image(&self) -> Option<ImageId> {
+        match self {
+            Self::Image(a, _, _) => Some(*a),
+            Self::Buffer(_, _, _) => None,
+            Self::Virtual(_, _) => None,
+            Self::ColorAttachment(a, _) => Some(*a),
+            Self::InputAttachment(a, _) => Some(*a),
+            Self::DepthAttachment(a, _) => Some(*a),
         }
     }
-    pub(crate) fn merge_access(&mut self, usage: &ResourceUsage) {
+
+    pub(crate) fn is_same_resource(&self, usage: &ResourceUsage) -> bool {
+        match (self, usage) {
+            (Self::Buffer(a, _, _), Self::Buffer(b, _, _)) => a == b,
+            (Self::Virtual(a, _), Self::Virtual(b, _)) => a == b,
+            (a, b) => a.image() == b.image(),
+        }
+    }
+    pub(crate) fn merge_access(
+        &mut self,
+        usage: &ResourceUsage,
+    ) -> Result<(), NodeConstructionError> {
         match (self, usage) {
             (Self::Image(_, mut access_a, mut stage_a), Self::Image(_, access_b, stage_b)) => {
                 access_a |= *access_b;
@@ -191,8 +231,27 @@ impl ResourceUsage {
             (Self::Virtual(_, mut access_a), Self::Virtual(_, access_b)) => {
                 access_a |= *access_b;
             }
-            _ => panic!("Trying to merge access flags of different resource kinds"),
-        }
+            (Self::ColorAttachment(_, index_a), Self::ColorAttachment(_, index_b))
+                if (index_a == index_b) =>
+            {
+                // nothing to merge
+            }
+            (Self::InputAttachment(_, index_a), Self::InputAttachment(_, index_b))
+                if (index_a == index_b) =>
+            {
+                // nothing to merge
+            }
+            (Self::DepthAttachment(_, mut access_a), Self::DepthAttachment(_, access_b)) => {
+                access_a.merge(access_b);
+            }
+            (a, b) => {
+                return Err(NodeConstructionError::InvalidResourceUsage(
+                    a.clone(),
+                    b.clone(),
+                ))
+            }
+        };
+        Ok(())
     }
 }
 impl ResourceAccess {
@@ -203,27 +262,10 @@ impl ResourceAccess {
             Self::Virtual(access) => access.is_empty(),
         }
     }
-    pub(crate) fn is_attachment_only(&self) -> bool {
-        match self {
-            Self::Image(access) => access.is_attachment_only(),
-            _ => false,
-        }
-    }
     pub(crate) fn is_attachment(&self) -> bool {
         match self {
             Self::Image(access) => access.is_attachment(),
             _ => false,
-        }
-    }
-
-    pub(crate) fn split_rw(&self) -> (Self, Self) {
-        match self {
-            Self::Image(access) => (Self::Image(access.reads()), Self::Image(access.writes())),
-            Self::Buffer(access) => (Self::Buffer(access.reads()), Self::Buffer(access.writes())),
-            Self::Virtual(access) => (
-                Self::Virtual(access.reads()),
-                Self::Virtual(access.writes()),
-            ),
         }
     }
 }
@@ -401,4 +443,12 @@ impl std::ops::BitOr for BufferUsage {
     fn bitor(self, other: Self) -> Self {
         Self::Custom(self.access() | other.access(), self.stage() | other.stage())
     }
+}
+
+enum AmethystStages {
+    Initialize,
+    Begin,
+    Logic,
+    PerFrameLogic,
+    Render,
 }
