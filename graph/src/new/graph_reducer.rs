@@ -30,11 +30,11 @@ impl<'a> ReductionContext<'a> {
 
 pub(crate) trait Reducer<B: Backend, T: ?Sized>: std::fmt::Debug {
     /// Try to reduce a node if possible.
-    fn reduce(&mut self, editor: &mut GraphEditor<'_, '_, B, T>, node: NodeIndex) -> Reduction;
+    fn reduce(&mut self, editor: &mut GraphEditor<B, T>, node: NodeIndex) -> Reduction;
     /// Invoked once when a round of reductions is finished. Can be used to
     /// do additional reductions at the end, which in turn can cause a new round
     /// of reductions.
-    fn finalize(&mut self, editor: &mut GraphEditor<'_, '_, B, T>) {
+    fn finalize(&mut self, editor: &mut GraphEditor<B, T>) {
         let _ = editor;
     }
 
@@ -134,9 +134,9 @@ impl ReductionState {
         self.state(node) == State::Dead
     }
 
-    fn replace<'a, B: Backend, T: ?Sized>(
+    fn replace<B: Backend, T: ?Sized>(
         &mut self,
-        graph: &mut PlanDag<'a, B, T>,
+        graph: &mut PlanDag<B, T>,
         node: NodeIndex,
         replacement: NodeIndex,
         max_id: NodeIndex,
@@ -179,7 +179,7 @@ impl ReductionState {
     fn reduce<'arena, B: Backend, T: ?Sized>(
         &mut self,
         reducers: &mut Reducers<B, T>,
-        graph: &mut PlanDag<'arena, B, T>,
+        graph: &mut PlanDag<'_, 'arena, B, T>,
         context: &ReductionContext<'arena>,
         alloc: &'arena GraphAllocator,
         node: NodeIndex,
@@ -237,10 +237,10 @@ impl ReductionState {
         return Reduction::Changed;
     }
 
-    fn reduce_node<'arena, B: Backend, T: ?Sized>(
+    fn reduce_node<'run, 'arena, B: Backend, T: ?Sized>(
         &mut self,
         reducers: &mut Reducers<B, T>,
-        graph: &mut PlanDag<'arena, B, T>,
+        graph: &mut PlanDag<'run, 'arena, B, T>,
         context: &ReductionContext<'arena>,
         alloc: &'arena GraphAllocator,
         node: NodeIndex,
@@ -293,9 +293,9 @@ impl ReductionState {
         debug_assert!(self.node_flags.is_empty());
     }
 
-    fn recurse_top_inputs<'a, B: Backend, T: ?Sized>(
+    fn recurse_top_inputs<B: Backend, T: ?Sized>(
         &mut self,
-        graph: &mut PlanDag<'a, B, T>,
+        graph: &mut PlanDag<B, T>,
         reset: bool,
     ) -> bool {
         let NodeProgress { node, input_index } = self.stack.last().copied().unwrap();
@@ -328,7 +328,7 @@ impl ReductionState {
     fn reduce_top<'arena, B: Backend, T: ?Sized>(
         &mut self,
         reducers: &mut Reducers<B, T>,
-        graph: &mut PlanDag<'arena, B, T>,
+        graph: &mut PlanDag<'_, 'arena, B, T>,
         context: &ReductionContext<'arena>,
         alloc: &'arena GraphAllocator,
     ) {
@@ -380,21 +380,21 @@ impl ReductionState {
     }
 }
 
-pub(crate) struct GraphEditor<'a, 'arena: 'a, B: Backend, T: ?Sized> {
+pub(crate) struct GraphEditor<'a, 'run, 'arena, B: Backend, T: ?Sized> {
     state: &'a mut ReductionState,
-    graph: &'a mut PlanDag<'arena, B, T>,
+    graph: &'a mut PlanDag<'run, 'arena, B, T>,
     context: &'a ReductionContext<'arena>,
     alloc: &'arena GraphAllocator,
 }
 
-impl<'a, 'arena: 'a, B: Backend, T: ?Sized> GraphEditor<'a, 'arena, B, T> {
+impl<'a, 'run, 'arena, B: Backend, T: ?Sized> GraphEditor<'a, 'run, 'arena, B, T> {
     #[inline(always)]
-    pub(crate) fn graph(&self) -> &PlanDag<'arena, B, T> {
+    pub(crate) fn graph(&self) -> &PlanDag<'run, 'arena, B, T> {
         self.graph
     }
 
     #[inline(always)]
-    pub(crate) fn graph_mut(&mut self) -> &mut PlanDag<'arena, B, T> {
+    pub(crate) fn graph_mut(&mut self) -> &mut PlanDag<'run, 'arena, B, T> {
         self.graph
     }
 
@@ -424,7 +424,7 @@ impl<'a, 'arena: 'a, B: Backend, T: ?Sized> GraphEditor<'a, 'arena, B, T> {
     }
 
     #[inline(always)]
-    pub(crate) fn insert_node(&mut self, node: PlanNode<'arena, B, T>) -> NodeIndex {
+    pub(crate) fn insert_node(&mut self, node: PlanNode<'run, B, T>) -> NodeIndex {
         self.graph.insert_node(self.alloc, node)
     }
 
@@ -462,7 +462,7 @@ impl<B: Backend, T: ?Sized> GraphReducer<B, T> {
 
     pub(crate) fn reduce_graph<'arena>(
         &mut self,
-        graph: &mut PlanDag<'arena, B, T>,
+        graph: &mut PlanDag<'_, 'arena, B, T>,
         context: &ReductionContext<'arena>,
         alloc: &'arena GraphAllocator,
     ) {

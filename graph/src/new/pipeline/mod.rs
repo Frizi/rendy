@@ -39,7 +39,11 @@ impl<B: Backend, T: ?Sized> Pipeline<B, T> {
         }
     }
     #[inline(never)]
-    pub(crate) fn reduce<'a>(&mut self, graph: &mut PlanDag<'a, B, T>, alloc: &'a GraphAllocator) {
+    pub(crate) fn reduce<'a>(
+        &mut self,
+        graph: &mut PlanDag<'_, 'a, B, T>,
+        alloc: &'a GraphAllocator,
+    ) {
         let start = std::time::Instant::now();
         // let mut file = std::fs::File::create("graph.dot").unwrap();
 
@@ -85,7 +89,7 @@ pub(crate) struct Contributions<'a> {
 
 impl<'a> Contributions<'a> {
     fn collect<B: Backend, T: ?Sized>(
-        graph: &PlanDag<'a, B, T>,
+        graph: &PlanDag<'_, 'a, B, T>,
         alloc: &'a GraphAllocator,
     ) -> Self {
         let align = 128;

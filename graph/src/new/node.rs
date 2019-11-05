@@ -1,6 +1,6 @@
 use {
     super::{
-        graph::NodeContext,
+        graph::{BufferToken, ImageToken, NodeContext, NodeCtx},
         resources::{BufferId, ImageId, ResourceUsage},
     },
     crate::{
@@ -18,17 +18,24 @@ use {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeId(pub(super) usize);
 
+pub type ConstructResult<'run, N, B, T> = Result<
+    (
+        <<N as Node<B, T>>::Outputs as OutputList>::Data,
+        NodeExecution<'run, B, T>,
+    ),
+    NodeConstructionError,
+>;
+
 /// Node is a basic building block of rendering graph.
 pub trait Node<B: Backend, T: ?Sized>: std::fmt::Debug + Send + Sync {
     type Outputs: OutputList;
 
     /// Construction phase of node, during which the usage of all graph resources is declared.
     /// Returns a rendering job that is going to be scheduled for execution if anything reads resources the node have declared to write.
-    fn construct(
-        &mut self,
-        ctx: &mut NodeContext<'_, '_, B, T>,
-        aux: &T,
-    ) -> Result<(<Self::Outputs as OutputList>::Data, NodeExecution<B, T>), NodeConstructionError>;
+    fn construct<'run>(
+        &'run mut self,
+        ctx: &mut impl NodeCtx<'run, B, T>,
+    ) -> ConstructResult<'run, Self, B, T>;
 
     /// Dispose of the node.
     /// Called after device idle
@@ -65,11 +72,10 @@ impl OutputStore {
 }
 
 /// Trait-object safe `Node`.
-pub trait DynNode<B: Backend, T: ?Sized>: std::fmt::Debug + Send + Sync {
-    fn construct(
-        &mut self,
-        ctx: &mut NodeContext<'_, '_, B, T>,
-        aux: &T,
+pub(crate) trait DynNode<B: Backend, T: ?Sized>: std::fmt::Debug + Send + Sync {
+    fn construct<'run>(
+        &'run mut self,
+        ctx: &mut NodeContext<'_, 'run, '_, B, T>,
     ) -> Result<NodeExecution<B, T>, NodeConstructionError>;
 
     /// # Safety
@@ -79,12 +85,11 @@ pub trait DynNode<B: Backend, T: ?Sized>: std::fmt::Debug + Send + Sync {
 }
 
 impl<B: Backend, T: ?Sized, N: Node<B, T>> DynNode<B, T> for N {
-    fn construct(
-        &mut self,
-        ctx: &mut NodeContext<'_, '_, B, T>,
-        aux: &T,
+    fn construct<'run>(
+        &'run mut self,
+        ctx: &mut NodeContext<'_, 'run, '_, B, T>,
     ) -> Result<NodeExecution<B, T>, NodeConstructionError> {
-        let (outs, exec) = N::construct(self, ctx, aux)?;
+        let (outs, exec) = N::construct(self, ctx)?;
         ctx.set_outputs(N::Outputs::iter(outs));
         Ok(exec)
     }
@@ -293,7 +298,7 @@ where
     }
 }
 
-pub trait DynNodeBuilder<B: Backend, T: ?Sized>: std::fmt::Debug {
+pub(crate) trait DynNodeBuilder<B: Backend, T: ?Sized>: std::fmt::Debug {
     fn num_outputs(&self) -> u32;
     fn build(
         self: Box<Self>,
@@ -399,6 +404,10 @@ pub struct ExecContext<'a, B: Backend> {
 }
 
 impl<'a, B: Backend> ExecContext<'a, B> {
+    pub(crate) fn new() -> Self {
+        unimplemented!()
+    }
+
     pub fn submit<C>(&mut self, submits: C)
     where
         C: IntoIterator,
@@ -417,16 +426,16 @@ impl<'a, B: Backend> ExecContext<'a, B> {
         }
     }
 
-    pub fn image(&self, id: ImageId) -> Result<&NodeImage<B>, NodeExecutionError> {
+    pub fn get_image(&self, token: ImageToken) -> &NodeImage<B> {
         self.images
-            .get(&id)
-            .ok_or(NodeExecutionError::UnscheduledImage(id))
+            .get(&token.id())
+            .expect("Somehow got a token to unscheduled image")
     }
 
-    pub fn buffer(&self, id: BufferId) -> Result<&NodeBuffer<B>, NodeExecutionError> {
+    pub fn get_buffer(&self, token: BufferToken) -> &NodeBuffer<B> {
         self.buffers
-            .get(&id)
-            .ok_or(NodeExecutionError::UnscheduledBuffer(id))
+            .get(&token.id())
+            .expect("Somehow got a token to unscheduled buffer")
     }
 
     pub fn frames(&self) -> &Frames<B> {
@@ -437,9 +446,25 @@ impl<'a, B: Backend> ExecContext<'a, B> {
 #[derive(Debug)]
 pub struct ExecPassContext<'a, B: Backend> {
     _general_ctx: ExecContext<'a, B>,
+    images: HashMap<ImageId, Handle<Image<B>>>,
+    buffers: HashMap<BufferId, Handle<Buffer<B>>>,
 }
 
-impl<'a, B: Backend> ExecContext<'a, B> {}
+impl<'a, B: Backend> ExecPassContext<'a, B> {
+    pub fn get_image(&self, token: ImageToken) -> Handle<Image<B>> {
+        self.images
+            .get(&token.id())
+            .expect("Somehow got a token to unscheduled image")
+            .clone()
+    }
+
+    pub fn get_buffer(&self, token: BufferToken) -> Handle<Buffer<B>> {
+        self.buffers
+            .get(&token.id())
+            .expect("Somehow got a token to unscheduled buffer")
+            .clone()
+    }
+}
 
 // struct PassData {
 

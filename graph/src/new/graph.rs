@@ -1,16 +1,17 @@
 use {
     super::{
         node::{
-            DynNode, DynNodeBuilder, GeneralFn, InternalUse, Node, NodeBuildError, NodeBuilder,
-            NodeConstructionError, NodeExecution, NodeExecutionError, NodeId, OutputList,
-            OutputStore, Parameter, PassFn,
+            DynNode, DynNodeBuilder, ExecContext, GeneralFn, InternalUse, Node, NodeBuildError,
+            NodeBuilder, NodeConstructionError, NodeExecution, NodeExecutionError, NodeId,
+            OutputList, OutputStore, Parameter, PassFn,
         },
         pipeline::Pipeline,
         resources::{
             AttachmentAccess, BufferId, BufferInfo, BufferUsage, ImageId, ImageInfo, ImageLoad,
             ImageUsage, NodeBufferAccess, NodeImageAccess, NodeVirtualAccess, ResourceId,
-            ResourceUsage, ShaderUsage, VirtualId,
+            ResourceUsage, VirtualId,
         },
+        walker::{GraphItem, TopoWithEdges},
     },
     crate::{
         command::Families,
@@ -18,9 +19,9 @@ use {
         resource::{Handle, Image},
     },
     gfx_hal::{pass::ATTACHMENT_UNUSED, Backend},
-    graphy::{EdgeIndex, GraphAllocator, NodeIndex},
+    graphy::{EdgeIndex, GraphAllocator, NodeIndex, Walker},
     smallvec::{smallvec, SmallVec},
-    std::{any::Any, collections::HashMap, ops::Range},
+    std::{any::Any, collections::HashMap, marker::PhantomData, ops::Range},
 };
 /// A builder type for rendering graph.
 #[derive(derivative::Derivative)]
@@ -99,10 +100,13 @@ impl<B: Backend, T: ?Sized> Graph<B, T> {
             self.alloc.reset();
         }
 
+        let ref mut nodes = self.nodes;
         let mut run_ctx = RunContext::new(factory, families, &self.alloc);
-        self.nodes.run_construction_phase(&mut run_ctx, aux)?;
+        nodes.run_construction_phase(&mut run_ctx, aux)?;
 
         self.pipeline.reduce(&mut run_ctx.graph.dag, &self.alloc);
+
+        run_ctx.run_execution_phase(aux)?;
 
         // Graph lowering
         // All graph excution types are eventually becoming a "General" nodes
@@ -162,9 +166,9 @@ impl<B: Backend, T: ?Sized> Graph<B, T> {
 
 impl<B: Backend, T: ?Sized> GraphNodes<B, T> {
     #[inline(never)]
-    fn run_construction_phase<'a: 'b, 'b>(
-        &'a mut self,
-        run_ctx: &mut RunContext<'b, B, T>,
+    fn run_construction_phase<'run, 'arena>(
+        &'run mut self,
+        run_ctx: &mut RunContext<'run, 'arena, B, T>,
         aux: &T,
     ) -> Result<(), GraphRunError> {
         // insert all nodes in their original order, except outputs that are inserted last
@@ -174,8 +178,8 @@ impl<B: Backend, T: ?Sized> GraphNodes<B, T> {
             let mut seed = run_ctx.graph.seed();
 
             let execution = {
-                let mut ctx = NodeContext::new(NodeId(i), &mut seed, run_ctx);
-                node.construct(&mut ctx, aux)
+                let mut ctx = NodeContext::new(NodeId(i), &mut seed, run_ctx, aux);
+                node.construct(&mut ctx)
                     .map_err(|e| GraphRunError::NodeConstruction(NodeId(i), e))?
             };
 
@@ -184,7 +188,7 @@ impl<B: Backend, T: ?Sized> GraphNodes<B, T> {
             } else {
                 run_ctx
                     .graph
-                    .insert(seed, execution)
+                    .insert(NodeId(i), seed, execution)
                     .map_err(|e| GraphRunError::NodeConstruction(NodeId(i), e))?;
             }
         }
@@ -192,7 +196,7 @@ impl<B: Backend, T: ?Sized> GraphNodes<B, T> {
         for (i, seed, execution) in outputs.drain().rev() {
             run_ctx
                 .graph
-                .insert(seed, execution)
+                .insert(NodeId(i), seed, execution)
                 .map_err(|e| GraphRunError::NodeConstruction(NodeId(i), e))?;
         }
 
@@ -203,56 +207,156 @@ impl<B: Backend, T: ?Sized> GraphNodes<B, T> {
 /// A context for rendergraph node construction phase. Contains all data that the node
 /// get access to and contains ready-made methods for common operations.
 #[derive(Debug)]
-pub struct NodeContext<'a, 'arena, B: Backend, T: ?Sized> {
+pub(crate) struct NodeContext<'ctx, 'run, 'arena, B: Backend, T: ?Sized> {
     id: NodeId,
-    seed: &'a mut NodeSeed,
-    run: &'a mut RunContext<'arena, B, T>,
+    seed: &'ctx mut NodeSeed,
+    run: &'ctx mut RunContext<'run, 'arena, B, T>,
     next_image_id: usize,
     next_buffer_id: usize,
+    aux: &'ctx T,
 }
 
-impl<'a, 'arena, B: Backend, T: ?Sized> NodeContext<'a, 'arena, B, T> {
-    fn new(id: NodeId, seed: &'a mut NodeSeed, run: &'a mut RunContext<'arena, B, T>) -> Self {
+/// A token that allows an image to be used in node execution
+#[derive(Debug, Clone, Copy)]
+pub struct ImageToken<'run>(ImageId, PhantomData<&'run ()>);
+
+/// A token that allows a buffer to be used in node execution
+#[derive(Debug, Clone, Copy)]
+pub struct BufferToken<'run>(BufferId, PhantomData<&'run ()>);
+
+impl ImageToken<'_> {
+    fn new(id: ImageId) -> Self {
+        Self(id, PhantomData)
+    }
+    pub(crate) fn id(&self) -> ImageId {
+        self.0
+    }
+}
+
+impl BufferToken<'_> {
+    fn new(id: BufferId) -> Self {
+        Self(id, PhantomData)
+    }
+    pub(crate) fn id(&self) -> BufferId {
+        self.0
+    }
+}
+
+pub trait NodeCtx<'run, B: Backend, T: ?Sized> {
+    fn factory(&self) -> &Factory<B>;
+    fn aux(&self) -> &T;
+
+    fn get_parameter<P: Any>(&self, id: Parameter<P>) -> Result<&P, NodeConstructionError>;
+
+    /// Create new image owned by graph.
+    fn create_image(&mut self, image_info: ImageInfo) -> ImageId;
+
+    /// Create new buffer owned by graph.
+    fn create_buffer(&mut self, buffer_info: BufferInfo) -> BufferId;
+
+    /// Create non-data dependency target. A virtual resource intended to
+    /// describe dependencies between rendering nodes without carrying any data.
+    fn create_virtual(&mut self) -> VirtualId;
+
+    /// Declare usage of virtual resource by the node.
+    fn use_virtual(
+        &mut self,
+        id: VirtualId,
+        access: NodeVirtualAccess,
+    ) -> Result<(), NodeConstructionError>;
+
+    /// Declare usage of image by the node.
+    fn use_image(
+        &mut self,
+        id: ImageId,
+        usage: ImageUsage,
+    ) -> Result<ImageToken<'run>, NodeConstructionError>;
+
+    /// Declare usage of buffer by the node.
+    fn use_buffer(
+        &mut self,
+        id: BufferId,
+        usage: BufferUsage,
+    ) -> Result<BufferToken<'run>, NodeConstructionError>;
+
+    /// Declare usage of a color attachment in render pass node.
+    ///
+    /// This is mutually exclusive with `use_image` calls on the same image,
+    /// and will cause construction error when non-renderpass execution is returned.
+    fn use_color(&mut self, index: usize, image: ImageId) -> Result<(), NodeConstructionError>;
+    /// Declare usage of a depth/stencil attachment in render pass node.
+    /// Depth attachment access can be read-only when depth write is never enabled in this pass.
+    ///
+    /// This is mutually exclusive with `use_image` calls on the same image,
+    /// and will cause construction error when non-renderpass execution is returned.
+    fn use_depth(
+        &mut self,
+        image: ImageId,
+        write_access: bool,
+    ) -> Result<(), NodeConstructionError>;
+    /// Declare usage of an input attachment in render pass node.
+    /// Input attachment access is always read-only and limited to fragment shaders.
+    ///
+    /// This is mutually exclusive with `use_image` calls on the same image,
+    /// and will cause construction error when non-renderpass execution is returned.
+    fn use_input(&mut self, index: usize, image: ImageId) -> Result<(), NodeConstructionError>;
+}
+
+impl<'ctx, 'run, 'arena, B: Backend, T: ?Sized> NodeContext<'ctx, 'run, 'arena, B, T> {
+    fn new(
+        id: NodeId,
+        seed: &'ctx mut NodeSeed,
+        run: &'ctx mut RunContext<'run, 'arena, B, T>,
+        aux: &'ctx T,
+    ) -> Self {
         Self {
             id,
             seed,
             run,
             next_image_id: 0,
             next_buffer_id: 0,
+            aux,
         }
     }
 
     pub(crate) fn set_outputs(&mut self, vals: impl Iterator<Item = Box<dyn Any>>) {
         self.run.output_store.set_all(self.id, vals);
     }
+}
 
-    pub fn factory(&self) -> &'arena Factory<B> {
-        self.run.factory
+impl<'run, B: Backend, T: ?Sized> NodeCtx<'run, B, T> for NodeContext<'_, 'run, '_, B, T> {
+    fn factory(&self) -> &Factory<B> {
+        &self.run.factory
     }
-    pub fn get_parameter<P: Any>(&self, id: Parameter<P>) -> Result<&P, NodeConstructionError> {
+
+    fn aux(&self) -> &T {
+        &self.aux
+    }
+
+    fn get_parameter<P: Any>(&self, id: Parameter<P>) -> Result<&P, NodeConstructionError> {
         self.run
             .output_store
             .get(id)
             .ok_or(NodeConstructionError::VariableReadFailed(id.0))
     }
-    /// Create new image owned by graph.
-    pub fn create_image(&mut self, image_info: ImageInfo) -> ImageId {
+
+    fn create_image(&mut self, image_info: ImageInfo) -> ImageId {
         let id = ImageId(self.id, self.next_image_id);
         self.next_image_id += 1;
         self.run.graph.create_image(id, image_info)
     }
-    /// Create new buffer owned by graph.
-    pub fn create_buffer(&mut self, buffer_info: BufferInfo) -> BufferId {
+
+    fn create_buffer(&mut self, buffer_info: BufferInfo) -> BufferId {
         let id = BufferId(self.id, self.next_buffer_id);
         self.next_buffer_id += 1;
         self.run.graph.create_buffer(id, buffer_info)
     }
-    /// Create non-data dependency target. A virtual resource intended to
-    /// describe dependencies between rendering nodes without carrying any data.
-    pub fn create_virtual(&mut self) -> VirtualId {
+
+    fn create_virtual(&mut self) -> VirtualId {
         self.run.graph.create_virtual()
     }
-    pub fn use_virtual(
+
+    fn use_virtual(
         &mut self,
         id: VirtualId,
         access: NodeVirtualAccess,
@@ -261,41 +365,36 @@ impl<'a, 'arena, B: Backend, T: ?Sized> NodeContext<'a, 'arena, B, T> {
             .graph
             .use_resource(self.seed, ResourceUsage::Virtual(id, access))
     }
-    /// Declare usage of image by the node
-    pub fn use_image(
+
+    fn use_image(
         &mut self,
         id: ImageId,
         usage: ImageUsage,
-    ) -> Result<(), NodeConstructionError> {
+    ) -> Result<ImageToken<'run>, NodeConstructionError> {
         self.run
             .graph
-            .use_resource(self.seed, usage.resource_usage(id))
+            .use_resource(self.seed, usage.resource_usage(id))?;
+        Ok(ImageToken::new(id))
     }
-    /// Declare usage of buffer by the node
-    pub fn use_buffer(
+
+    fn use_buffer(
         &mut self,
         id: BufferId,
         usage: BufferUsage,
-    ) -> Result<(), NodeConstructionError> {
+    ) -> Result<BufferToken<'run>, NodeConstructionError> {
         self.run
             .graph
-            .use_resource(self.seed, usage.resource_usage(id))
+            .use_resource(self.seed, usage.resource_usage(id))?;
+        Ok(BufferToken::new(id))
     }
-    /// Declare usage of a color attachment in render pass node.
-    ///
-    /// This is mutually exclusive with `use_image` calls on the same image,
-    /// and will cause construction error when non-renderpass execution is returned.
-    pub fn use_color(&mut self, index: usize, image: ImageId) -> Result<(), NodeConstructionError> {
+
+    fn use_color(&mut self, index: usize, image: ImageId) -> Result<(), NodeConstructionError> {
         self.run
             .graph
             .use_resource(self.seed, ResourceUsage::ColorAttachment(image, index))
     }
-    /// Declare usage of a depth/stencil attachment in render pass node.
-    /// Depth attachment access can be read-only when depth write is never enabled in this pass.
-    ///
-    /// This is mutually exclusive with `use_image` calls on the same image,
-    /// and will cause construction error when non-renderpass execution is returned.
-    pub fn use_depth(
+
+    fn use_depth(
         &mut self,
         image: ImageId,
         write_access: bool,
@@ -309,12 +408,8 @@ impl<'a, 'arena, B: Backend, T: ?Sized> NodeContext<'a, 'arena, B, T> {
             .graph
             .use_resource(self.seed, ResourceUsage::DepthAttachment(image, access))
     }
-    /// Declare usage of an input attachment in render pass node.
-    /// Input attachment access is always read-only and limited to fragment shaders.
-    ///
-    /// This is mutually exclusive with `use_image` calls on the same image,
-    /// and will cause construction error when non-renderpass execution is returned.
-    pub fn use_input(&mut self, index: usize, image: ImageId) -> Result<(), NodeConstructionError> {
+
+    fn use_input(&mut self, index: usize, image: ImageId) -> Result<(), NodeConstructionError> {
         self.run
             .graph
             .use_resource(self.seed, ResourceUsage::InputAttachment(image, index))
@@ -356,11 +451,11 @@ pub(crate) enum PlanNode<'n, B: Backend, T: ?Sized> {
     UndefinedImage,
     UndefinedBuffer,
     /// A subpass that might have multiple render groups.
-    RenderSubpass(SmallVec<[PassFn<'n, B, T>; 4]>),
+    RenderSubpass(SmallVec<[(NodeId, PassFn<'n, B, T>); 4]>),
     /// A render pass - group of subpasses with dependencies between them
     RenderPass(RenderPassNode<'n, B, T>),
     /// A node representing arbitrary runnable operation.
-    Run(GeneralFn<'n, B, T>),
+    Run(NodeId, GeneralFn<'n, B, T>),
     /// Resolve multisampled image into non-multisampled one.
     /// Currently this works under asumption that all layers of source image are resolved into first layer of destination.
     ResolveImage,
@@ -460,7 +555,7 @@ impl AttachmentRefEdge {
 }
 
 pub(crate) struct RenderPassSubpass<'n, B: Backend, T: ?Sized> {
-    pub(crate) groups: SmallVec<[PassFn<'n, B, T>; 4]>,
+    pub(crate) groups: SmallVec<[(NodeId, PassFn<'n, B, T>); 4]>,
     pub(crate) colors: SmallVec<[gfx_hal::pass::AttachmentRef; 8]>,
     pub(crate) inputs: SmallVec<[gfx_hal::pass::AttachmentRef; 8]>,
     pub(crate) resolves: SmallVec<[gfx_hal::pass::AttachmentRef; 4]>,
@@ -479,7 +574,7 @@ impl<'n, B: Backend, T: ?Sized> std::fmt::Debug for RenderPassSubpass<'n, B, T> 
     }
 }
 impl<'n, B: Backend, T: ?Sized> RenderPassSubpass<'n, B, T> {
-    pub(crate) fn new(groups: SmallVec<[PassFn<'n, B, T>; 4]>) -> Self {
+    pub(crate) fn new(groups: SmallVec<[(NodeId, PassFn<'n, B, T>); 4]>) -> Self {
         Self {
             groups,
             colors: SmallVec::new(),
@@ -566,6 +661,12 @@ pub(crate) struct RenderPassAtachment {
     pub(crate) first_layout: gfx_hal::image::Layout,
 }
 
+impl RenderPassAtachment {
+    pub(crate) fn is_write(&self) -> bool {
+        self.first_write.is_some()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct AttachmentClear(pub(crate) Option<gfx_hal::command::ClearValue>);
 
@@ -643,7 +744,7 @@ impl<'n, B: Backend, T: ?Sized> std::fmt::Debug for PlanNode<'n, B, T> {
                 fmt.write_str("]")?;
                 Ok(())
             }
-            PlanNode::Run(_) => fmt.debug_tuple("Run").finish(),
+            PlanNode::Run(..) => fmt.debug_tuple("Run").finish(),
             PlanNode::ResolveImage => fmt.debug_tuple("ResolveImage").finish(),
             PlanNode::Root => fmt.debug_tuple("Root").finish(),
         }
@@ -653,7 +754,7 @@ impl<'n, B: Backend, T: ?Sized> std::fmt::Debug for PlanNode<'n, B, T> {
 impl PlanEdge {
     pub(crate) fn is_pass_attachment(&self) -> bool {
         match self {
-            PlanEdge::PassAttachment(attachment) => true,
+            PlanEdge::PassAttachment(..) => true,
             _ => false,
         }
     }
@@ -700,11 +801,11 @@ struct NodeSeed {
     resources: Range<usize>,
 }
 
-pub(crate) type PlanDag<'arena, B, T> = graphy::Graph<'arena, PlanNode<'arena, B, T>, PlanEdge>;
+pub(crate) type PlanDag<'run, 'arena, B, T> = graphy::Graph<'arena, PlanNode<'run, B, T>, PlanEdge>;
 
 #[derive(Debug)]
-pub struct PlanGraph<'arena, B: Backend, T: ?Sized> {
-    dag: PlanDag<'arena, B, T>,
+pub struct PlanGraph<'run, 'arena, B: Backend, T: ?Sized> {
+    dag: PlanDag<'run, 'arena, B, T>,
     alloc: &'arena GraphAllocator,
     virtuals: usize,
     last_writes: HashMap<ResourceId, NodeIndex>,
@@ -712,7 +813,7 @@ pub struct PlanGraph<'arena, B: Backend, T: ?Sized> {
     retained_images: HashMap<(NodeId, usize), Handle<Image<B>>>,
 }
 
-impl<'arena, B: Backend, T: ?Sized> PlanGraph<'arena, B, T> {
+impl<'run, 'arena, B: Backend, T: ?Sized> PlanGraph<'run, 'arena, B, T> {
     fn new(alloc: &'arena GraphAllocator) -> Self {
         let mut dag = PlanDag::new();
         // guaranteed to always be index 0
@@ -814,7 +915,7 @@ impl<'arena, B: Backend, T: ?Sized> PlanGraph<'arena, B, T> {
         VirtualId(self.virtuals - 1)
     }
 
-    fn insert_node(&mut self, node: PlanNode<'arena, B, T>) -> NodeIndex {
+    fn insert_node(&mut self, node: PlanNode<'run, B, T>) -> NodeIndex {
         self.dag.insert_node(self.alloc, node)
     }
 
@@ -822,7 +923,7 @@ impl<'arena, B: Backend, T: ?Sized> PlanGraph<'arena, B, T> {
         &mut self,
         parent: NodeIndex,
         edge: PlanEdge,
-        node: PlanNode<'arena, B, T>,
+        node: PlanNode<'run, B, T>,
     ) -> NodeIndex {
         self.dag.insert_child(self.alloc, parent, edge, node).1
     }
@@ -846,8 +947,9 @@ impl<'arena, B: Backend, T: ?Sized> PlanGraph<'arena, B, T> {
 
     fn insert(
         &mut self,
+        node_id: NodeId,
         seed: NodeSeed,
-        exec: NodeExecution<'arena, B, T>,
+        exec: NodeExecution<'run, B, T>,
     ) -> Result<(), NodeConstructionError> {
         // inserts should always happen in such order that resource usages are free to be drained
         debug_assert!(self.resource_usage.len() == seed.resources.end);
@@ -855,12 +957,12 @@ impl<'arena, B: Backend, T: ?Sized> PlanGraph<'arena, B, T> {
         // insert execution node
         let (node, allow_attachments) = match exec {
             NodeExecution::RenderPass(group) => (
-                self.insert_node(PlanNode::RenderSubpass(smallvec![group])),
+                self.insert_node(PlanNode::RenderSubpass(smallvec![(node_id, group)])),
                 true,
             ),
-            NodeExecution::General(run) => (self.insert_node(PlanNode::Run(run)), false),
+            NodeExecution::General(run) => (self.insert_node(PlanNode::Run(node_id, run)), false),
             NodeExecution::Output(run) => {
-                let node = self.insert_node(PlanNode::Run(run));
+                let node = self.insert_node(PlanNode::Run(node_id, run));
                 self.insert_edge(node, NodeIndex::new(0), PlanEdge::Effect);
                 (node, false)
             }
@@ -1042,15 +1144,15 @@ impl<'arena, B: Backend, T: ?Sized> PlanGraph<'arena, B, T> {
 }
 
 #[derive(Debug)]
-pub(crate) struct RunContext<'arena, B: Backend, T: ?Sized> {
+pub(crate) struct RunContext<'run, 'arena, B: Backend, T: ?Sized> {
     // not really 'arena, but has to live at least as long, so it's fine
     pub(crate) factory: &'arena Factory<B>,
     pub(crate) families: &'arena Families<B>,
     pub(crate) output_store: OutputStore,
-    graph: PlanGraph<'arena, B, T>,
+    graph: PlanGraph<'run, 'arena, B, T>,
 }
 
-impl<'arena, B: Backend, T: ?Sized> RunContext<'arena, B, T> {
+impl<'run, 'arena, B: Backend, T: ?Sized> RunContext<'run, 'arena, B, T> {
     pub(crate) fn new(
         factory: &'arena Factory<B>,
         families: &'arena Families<B>,
@@ -1062,6 +1164,59 @@ impl<'arena, B: Backend, T: ?Sized> RunContext<'arena, B, T> {
             output_store: OutputStore::new(),
             graph: PlanGraph::new(allocator),
         }
+    }
+
+    fn run_execution_phase(self, aux: &T) -> Result<(), GraphRunError> {
+        let topo: Vec<_> = TopoWithEdges::new(&self.graph.dag, NodeIndex::new(0))
+            .iter(&self.graph.dag)
+            .collect();
+
+        let (mut nodes, mut edges) = self.graph.dag.into_items();
+
+        for item in topo.into_iter().rev() {
+            // :TakeShouldMove
+            // @Cleanup: Those replaces should not be necessary
+            match item {
+                GraphItem::Node(node) => {
+                    match std::mem::replace(nodes.take(node).unwrap(), PlanNode::Root) {
+                        PlanNode::Image(..) => {}
+                        PlanNode::Buffer(..) => {}
+                        PlanNode::ClearImage(..) => {}
+                        PlanNode::ClearBuffer(..) => {}
+                        PlanNode::LoadImage(..) => {}
+                        PlanNode::StoreImage(..) => {}
+                        PlanNode::RenderPass(..) => {}
+                        PlanNode::Run(node_id, closure) => {
+                            let ctx = ExecContext::new();
+                            closure(ctx, aux)
+                                .map_err(|e| GraphRunError::NodeExecution(node_id, e))?
+                        }
+                        PlanNode::ResolveImage => {}
+                        PlanNode::ImageVersion => {}
+                        PlanNode::BufferVersion => {}
+                        PlanNode::UndefinedImage => {}
+                        PlanNode::UndefinedBuffer => {}
+                        PlanNode::Root => {}
+                        n @ PlanNode::RenderSubpass(..) => {
+                            panic!("Unexpected unprocessed node {:?}", n)
+                        }
+                    }
+                }
+                GraphItem::Edge(edge) => {
+                    match std::mem::replace(edges.take(edge).unwrap(), PlanEdge::Effect) {
+                        PlanEdge::Effect | PlanEdge::Version | PlanEdge::Origin => {}
+                        e @ PlanEdge::AttachmentRef(..)
+                        | e @ PlanEdge::PassAttachment(..)
+                        | e @ PlanEdge::BufferAccess(..)
+                        | e @ PlanEdge::ImageAccess(..) => {
+                            panic!("Unexpected unprocessed edge {:?}", e)
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 /// Error that happen during rendering graph run.
@@ -1087,7 +1242,11 @@ mod test {
     use crate::{
         command::Family,
         factory::Factory,
-        new::test::{test_init, visualize_graph, TestBackend},
+        new::{
+            node::ConstructResult,
+            resources::ShaderUsage,
+            test::{test_init, visualize_graph, TestBackend},
+        },
     };
 
     impl NodeBuilder<TestBackend, ()> for ImageInfo {
@@ -1105,11 +1264,10 @@ mod test {
 
     impl Node<TestBackend, ()> for ImageInfo {
         type Outputs = Parameter<ImageId>;
-        fn construct(
-            &mut self,
-            ctx: &mut NodeContext<TestBackend, ()>,
-            _: &(),
-        ) -> Result<(ImageId, NodeExecution<'_, TestBackend, ()>), NodeConstructionError> {
+        fn construct<'run>(
+            &'run mut self,
+            ctx: &mut impl NodeCtx<'run, TestBackend, ()>,
+        ) -> ConstructResult<'run, Self, TestBackend, ()> {
             let image = ctx.create_image(*self);
             Ok((image, NodeExecution::None))
         }
@@ -1143,11 +1301,10 @@ mod test {
     impl Node<TestBackend, ()> for TestPass {
         type Outputs = ();
 
-        fn construct(
-            &mut self,
-            ctx: &mut NodeContext<TestBackend, ()>,
-            _: &(),
-        ) -> Result<((), NodeExecution<'_, TestBackend, ()>), NodeConstructionError> {
+        fn construct<'run>(
+            &'run mut self,
+            ctx: &mut impl NodeCtx<'run, TestBackend, ()>,
+        ) -> ConstructResult<'run, Self, TestBackend, ()> {
             let color = *ctx.get_parameter(self.color)?;
             ctx.use_color(0, color)?;
             if let Some(depth) = self.depth {
@@ -1196,11 +1353,10 @@ mod test {
     impl Node<TestBackend, ()> for TestPass2 {
         type Outputs = ();
 
-        fn construct(
-            &mut self,
-            ctx: &mut NodeContext<TestBackend, ()>,
-            _: &(),
-        ) -> Result<((), NodeExecution<'_, TestBackend, ()>), NodeConstructionError> {
+        fn construct<'run>(
+            &'run mut self,
+            ctx: &mut impl NodeCtx<'run, TestBackend, ()>,
+        ) -> ConstructResult<'run, Self, TestBackend, ()> {
             if let Some(color1) = self.color1 {
                 let color1 = *ctx.get_parameter(color1)?;
                 ctx.use_color(0, color1)?;
@@ -1245,23 +1401,29 @@ mod test {
     impl Node<TestBackend, ()> for TestCompute1 {
         type Outputs = Parameter<BufferId>;
 
-        fn construct(
-            &mut self,
-            ctx: &mut NodeContext<TestBackend, ()>,
-            _: &(),
-        ) -> Result<(BufferId, NodeExecution<'_, TestBackend, ()>), NodeConstructionError> {
+        fn construct<'run>(
+            &'run mut self,
+            ctx: &mut impl NodeCtx<'run, TestBackend, ()>,
+        ) -> ConstructResult<'run, Self, TestBackend, ()> {
             let buf_id = ctx.create_buffer(BufferInfo {
                 size: 1,
                 clear: None,
             });
-            ctx.use_buffer(buf_id, BufferUsage::StorageWrite(ShaderUsage::COMPUTE))?;
+            let buf_usage =
+                ctx.use_buffer(buf_id, BufferUsage::StorageWrite(ShaderUsage::COMPUTE))?;
 
             if let Some(color) = self.color {
                 let color = *ctx.get_parameter(color)?;
                 ctx.use_color(0, color)?;
             }
 
-            Ok((buf_id, NodeExecution::pass(|_, _| Ok(()))))
+            Ok((
+                buf_id,
+                NodeExecution::pass(move |_, _| {
+                    println!("{:?}, {:?}", buf_usage, self);
+                    Ok(())
+                }),
+            ))
         }
     }
 
@@ -1298,11 +1460,10 @@ mod test {
     impl Node<TestBackend, ()> for TestPass3 {
         type Outputs = ();
 
-        fn construct(
-            &mut self,
-            ctx: &mut NodeContext<TestBackend, ()>,
-            _: &(),
-        ) -> Result<((), NodeExecution<'_, TestBackend, ()>), NodeConstructionError> {
+        fn construct<'run>(
+            &'run mut self,
+            ctx: &mut impl NodeCtx<'run, TestBackend, ()>,
+        ) -> ConstructResult<'run, Self, TestBackend, ()> {
             let color = *ctx.get_parameter(self.color)?;
             let buffer = *ctx.get_parameter(self.buffer)?;
 
@@ -1335,19 +1496,24 @@ mod test {
 
     impl Node<TestBackend, ()> for TestOutput {
         type Outputs = Parameter<ImageId>;
-        fn construct(
-            &mut self,
-            ctx: &mut NodeContext<TestBackend, ()>,
-            _: &(),
-        ) -> Result<(ImageId, NodeExecution<'_, TestBackend, ()>), NodeConstructionError> {
+        fn construct<'run>(
+            &'run mut self,
+            ctx: &mut impl NodeCtx<'run, TestBackend, ()>,
+        ) -> ConstructResult<'run, Self, TestBackend, ()> {
             let output = ctx.create_image(ImageInfo {
                 kind: gfx_hal::image::Kind::D2(1024, 1024, 1, 1),
                 levels: 1,
                 format: gfx_hal::format::Format::Rgba8Unorm,
                 load: ImageLoad::DontCare,
             });
-            ctx.use_image(output, ImageUsage::ColorAttachmentRead)?;
-            Ok((output, NodeExecution::output(|_, _| Ok(()))))
+            let output_use = ctx.use_image(output, ImageUsage::ColorAttachmentRead)?;
+            Ok((
+                output,
+                NodeExecution::output(move |ctx, _| {
+                    let _output = ctx.get_image(output_use);
+                    Ok(())
+                }),
+            ))
         }
     }
 
@@ -1414,7 +1580,9 @@ mod test {
 
         let mut file = std::fs::File::create("graph.dot").unwrap();
         visualize_graph(&mut file, &run_ctx.graph.dag, "raw");
+
         graph.pipeline.reduce(&mut run_ctx.graph.dag, &graph.alloc);
         visualize_graph(&mut file, &run_ctx.graph.dag, "opti");
+        run_ctx.run_execution_phase(&()).unwrap();
     }
 }

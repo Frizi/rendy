@@ -347,10 +347,10 @@ mod test {
     use smallvec::SmallVec;
 
     fn subpass_node<'a>(num_groups: usize) -> PlanNode<'a, TestBackend, ()> {
-        let mut vec: SmallVec<[PassFn<'a, TestBackend, ()>; 4]> =
+        let mut vec: SmallVec<[(NodeId, PassFn<'a, TestBackend, ()>); 4]> =
             SmallVec::with_capacity(num_groups);
         for _ in 0..num_groups {
-            vec.push(Box::new(|_, _| Ok(())))
+            vec.push((NodeId(0), Box::new(|_, _| Ok(()))))
         }
         PlanNode::RenderSubpass(vec)
     }
@@ -591,7 +591,7 @@ mod test {
             group2 = group_node();
             @ group3 = group_node();
             group4 = group_node();
-            @ debug_pass = PlanNode::Run(Box::new(|_, _| Ok(())));
+            @ debug_pass = PlanNode::Run(NodeId(0), Box::new(|_, _| Ok(())));
 
             depth_def = depth_node(0);
             color_def = color_node(1);
@@ -652,7 +652,7 @@ mod test {
             [&alloc],
             @ main_pass = subpass_node(3);
             ext_pass = subpass_node(1);
-            @ debug_pass = PlanNode::Run(Box::new(|_, _| Ok(())));
+            @ debug_pass = PlanNode::Run(NodeId(0), Box::new(|_, _| Ok(())));
 
             depth_def = depth_node(0);
             color_def = color_node(1);

@@ -7,10 +7,10 @@ use {
         factory::Factory,
         frame::cirque::CommandCirqueOverlap,
         new::{
-            graph::NodeContext,
+            graph::NodeCtx,
             node::{
-                gfx_acquire_barriers, gfx_release_barriers, Node, NodeBuildError, NodeBuilder,
-                NodeConstructionError, NodeExecution, NodeImage, OutputList, Parameter,
+                gfx_acquire_barriers, gfx_release_barriers, ConstructResult, Node, NodeBuildError,
+                NodeBuilder, NodeExecution, NodeImage, Parameter,
             },
             resources::{ImageId, ImageUsage},
             track::Track,
@@ -71,17 +71,15 @@ pub struct CopyImage<B: Backend> {
 impl<B: Backend, T: ?Sized> Node<B, T> for CopyImage<B> {
     type Outputs = ();
 
-    fn construct(
-        &mut self,
-        ctx: &mut NodeContext<'_, '_, B, T>,
-        _aux: &T,
-    ) -> Result<(<Self::Outputs as OutputList>::Data, NodeExecution<'_, B, T>), NodeConstructionError>
-    {
+    fn construct<'run>(
+        &'run mut self,
+        ctx: &mut impl NodeCtx<'run, B, T>,
+    ) -> ConstructResult<'run, Self, B, T> {
         let src_id = *ctx.get_parameter(self.src)?;
         let dst_id = *ctx.get_parameter(self.dst)?;
 
-        ctx.use_image(src_id, ImageUsage::TransferRead)?;
-        ctx.use_image(dst_id, ImageUsage::TransferWrite)?;
+        let src = ctx.use_image(src_id, ImageUsage::TransferRead)?;
+        let dst = ctx.use_image(dst_id, ImageUsage::TransferWrite)?;
 
         let pool = &mut self.pool;
         let submit = &mut self.submit;
@@ -90,8 +88,8 @@ impl<B: Backend, T: ?Sized> Node<B, T> for CopyImage<B> {
         Ok((
             (),
             NodeExecution::general(move |mut ctx, _| {
-                let src_image = ctx.image(src_id)?;
-                let dst_image = ctx.image(dst_id)?;
+                let src_image = ctx.get_image(src);
+                let dst_image = ctx.get_image(dst);
 
                 let submit = submit.track(
                     (src_image.image.instance(), dst_image.image.instance()),

@@ -25,20 +25,22 @@ impl<'a, B: Backend, T: ?Sized> Reducer<B, T> for CombineVersionsReducer {
     }
 }
 
-// #[derive(Debug)]
-// pub(super) struct InsertStoresReducer;
-// impl<'a, B: Backend, T: ?Sized> Reducer<B, T> for InsertStoresReducer {
-//     fn reduce(&mut self, editor: &mut GraphEditor<B, T>, node: NodeIndex) -> Reduction {
-//         if let PlanNode::LoadImage(node_id, index) = editor.graph()[node] {
-//             let mut head = node;
-//             while let Some(version) = head.child_version(editor.graph()) {
-//                 head = version;
-//             }
-//             editor.insert_edge_unchecked(head, NodeIndex::new(0), PlanEdge::Effect);
-//         }
-//         Reduction::NoChange
-//     }
-// }
+#[derive(Debug)]
+pub(super) struct InsertStoresReducer;
+impl<'a, B: Backend, T: ?Sized> Reducer<B, T> for InsertStoresReducer {
+    fn reduce(&mut self, editor: &mut GraphEditor<B, T>, node: NodeIndex) -> Reduction {
+        if let PlanNode::LoadImage(..) = editor.graph()[node] {
+            let mut head = node;
+            while let Some(version) = head.child_version(editor.graph()) {
+                head = version;
+            }
+            editor
+                .insert_edge_unchecked(head, NodeIndex::new(0), PlanEdge::Effect)
+                .unwrap();
+        }
+        Reduction::NoChange
+    }
+}
 
 #[derive(Debug)]
 pub(super) struct OrderWritesReducer;
@@ -46,17 +48,19 @@ impl<B: Backend, T: ?Sized> Reducer<B, T> for OrderWritesReducer {
     fn reduce(&mut self, editor: &mut GraphEditor<B, T>, node: NodeIndex) -> Reduction {
         let mut write_accesses = node
             .children()
-            .filter(|graph, &(edge, _)| match graph[edge] {
+            .filter(|graph, &(edge, _)| match &graph[edge] {
                 PlanEdge::ImageAccess(access, _) => access.is_write(),
                 PlanEdge::BufferAccess(access, _) => access.is_write(),
+                PlanEdge::PassAttachment(att) => att.is_write(),
                 _ => false,
             });
 
         let mut read_accesses = node
             .children()
-            .filter(|graph, &(edge, _)| match graph[edge] {
+            .filter(|graph, &(edge, _)| match &graph[edge] {
                 PlanEdge::ImageAccess(access, _) => !access.is_write(),
                 PlanEdge::BufferAccess(access, _) => !access.is_write(),
+                PlanEdge::PassAttachment(att) => !att.is_write(),
                 _ => false,
             });
 
@@ -67,10 +71,15 @@ impl<B: Backend, T: ?Sized> Reducer<B, T> for OrderWritesReducer {
         if let Some((_, write)) = write_access {
             let mut next = read_accesses.walk_next(editor.graph());
             while let Some((_, read)) = next {
-                editor
-                    .insert_edge_unchecked(read, write, PlanEdge::Effect)
-                    .unwrap();
-                editor.revisit(read);
+                // do not insert redundant edge if usage relation is already present
+                // Note that `contributions.uses` can have false negatives at this point,
+                // because contributions are not recomputed before this pass.
+                if !editor.context().contributions.uses(write, read) {
+                    editor
+                        .insert_edge_unchecked(read, write, PlanEdge::Effect)
+                        .unwrap();
+                    editor.revisit(read);
+                }
                 next = read_accesses.walk_next(editor.graph());
             }
         }

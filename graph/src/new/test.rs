@@ -119,12 +119,12 @@ pub(crate) fn visualize_graph<B: gfx_hal::Backend, T: ?Sized>(
     use crate::new::graph::{PlanEdge, PlanNode};
     use graphy::{EdgeIndex, NodeIndex};
 
-    struct Visualize<'a, 'b, B: gfx_hal::Backend, T: ?Sized>(&'b PlanDag<'a, B, T>, String);
+    struct Visualize<'a, 'r, 'b, B: gfx_hal::Backend, T: ?Sized>(&'b PlanDag<'r, 'a, B, T>, String);
 
-    impl<'a, 'b, B: gfx_hal::Backend, T: ?Sized> Visualize<'a, 'b, B, T> {
+    impl<'a, 'r, 'b, B: gfx_hal::Backend, T: ?Sized> Visualize<'a, 'r, 'b, B, T> {
         fn edge_color(&self, index: EdgeIndex) -> &'static str {
             match self.0.get_edge(index).unwrap() {
-                PlanEdge::Effect => "#ff615d",
+                PlanEdge::Effect => "#d119bf",
                 PlanEdge::Origin => "#ff950f",
                 PlanEdge::Version => "#ff250f",
                 PlanEdge::ImageAccess(_, _) => "#aaaaff",
@@ -140,13 +140,13 @@ pub(crate) fn visualize_graph<B: gfx_hal::Backend, T: ?Sized>(
                 PlanNode::Image { .. } => "#0000ff",
                 PlanNode::ImageVersion => "#2266ff",
                 PlanNode::UndefinedImage => "#2266ff",
-                PlanNode::ClearImage(_) => "#2266ff",
+                PlanNode::ClearImage(..) => "#2266ff",
                 PlanNode::BufferVersion => "#330000",
                 PlanNode::UndefinedBuffer => "#330000",
-                PlanNode::ClearBuffer(_) => "#330000",
-                PlanNode::RenderSubpass(_) => "#03c03c",
-                PlanNode::RenderPass(_) => "#03c03c",
-                PlanNode::Run(_) => "#9b03c0",
+                PlanNode::ClearBuffer(..) => "#330000",
+                PlanNode::RenderSubpass(..) => "#03c03c",
+                PlanNode::RenderPass(..) => "#03c03c",
+                PlanNode::Run(..) => "#9b03c0",
                 _ => "black",
             }
         }
@@ -218,8 +218,8 @@ pub(crate) fn visualize_graph<B: gfx_hal::Backend, T: ?Sized>(
         }
     }
 
-    impl<'a, 'b, B: gfx_hal::Backend, T: ?Sized> dot::Labeller<'b, Item, Edge>
-        for Visualize<'a, 'b, B, T>
+    impl<'a, 'r, 'b, B: gfx_hal::Backend, T: ?Sized> dot::Labeller<'b, Item, Edge>
+        for Visualize<'a, 'r, 'b, B, T>
     {
         fn graph_id(&'b self) -> dot::Id<'b> {
             dot::Id::new(std::borrow::Cow::Borrowed(self.1.as_str())).unwrap()
@@ -233,16 +233,14 @@ pub(crate) fn visualize_graph<B: gfx_hal::Backend, T: ?Sized>(
         }
         fn node_label(&'b self, n: &Item) -> dot::LabelText<'b> {
             match n {
-                Item::Node(n_id) => match self.0.get_node(*n_id).unwrap() {
-                    n => dot::LabelText::HtmlStr(
-                        format!(
-                            "<font color=\"{}\">{}</font>",
-                            self.node_color(*n_id),
-                            self.node_label(*n_id),
-                        )
-                        .into(),
-                    ),
-                },
+                Item::Node(n_id) => dot::LabelText::HtmlStr(
+                    format!(
+                        "<font color=\"{}\">{}</font>",
+                        self.node_color(*n_id),
+                        self.node_label(*n_id),
+                    )
+                    .into(),
+                ),
                 Item::Edge(e) => dot::LabelText::HtmlStr(
                     format!(
                         "<font color=\"{}\">{}</font>",
@@ -299,8 +297,8 @@ pub(crate) fn visualize_graph<B: gfx_hal::Backend, T: ?Sized>(
         }
     }
 
-    impl<'a, 'b, B: gfx_hal::Backend, T: ?Sized> dot::GraphWalk<'b, Item, Edge>
-        for Visualize<'a, 'b, B, T>
+    impl<'a, 'r, 'b, B: gfx_hal::Backend, T: ?Sized> dot::GraphWalk<'b, Item, Edge>
+        for Visualize<'a, 'r, 'b, B, T>
     {
         fn nodes(&'b self) -> dot::Nodes<'b, Item> {
             let nodes = self.0.nodes_indices_iter().map(|n| Item::Node(n));
