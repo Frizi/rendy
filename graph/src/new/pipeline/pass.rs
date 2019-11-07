@@ -7,11 +7,11 @@ use {
         graph_reducer::{GraphEditor, Reducer, Reduction},
         pipeline::node_ext::NodeExt,
     },
-    gfx_hal::{
+    graphy::{NodeIndex, Walker},
+    rendy_core::hal::{
         pass::{AttachmentLoadOp, AttachmentOps, AttachmentStoreOp},
         Backend,
     },
-    graphy::{NodeIndex, Walker},
     smallvec::SmallVec,
 };
 
@@ -198,6 +198,7 @@ impl<'a, B: Backend, T: ?Sized> Reducer<B, T> for CombinePassesReducer {
                         &mut editor.graph_mut()[edge].attachment_ref().unwrap(),
                         &mut subpass,
                         subpass_index,
+                        &mut new_deps,
                         ops,
                         clear,
                         num_attachments,
@@ -218,7 +219,7 @@ impl<'a, B: Backend, T: ?Sized> Reducer<B, T> for CombinePassesReducer {
             pass.deps.extend(new_deps.drain());
             Reduction::Replace(pass_node)
         } else {
-            let mut pass_node = RenderPassNode::new();
+            let mut pass = RenderPassNode::new();
             // we've got a beginning of brand new render pass
             let mut num_attachments = 0;
             while let Some((edge, writer)) = attachments.walk_next(editor.graph()) {
@@ -227,6 +228,7 @@ impl<'a, B: Backend, T: ?Sized> Reducer<B, T> for CombinePassesReducer {
                     &mut editor.graph_mut()[edge].attachment_ref().unwrap(),
                     &mut subpass,
                     0,
+                    &mut pass.deps,
                     ops,
                     clear,
                     num_attachments,
@@ -235,8 +237,8 @@ impl<'a, B: Backend, T: ?Sized> Reducer<B, T> for CombinePassesReducer {
                 num_attachments += 1;
             }
 
-            pass_node.subpasses.push(subpass);
-            editor.graph_mut()[node] = PlanNode::RenderPass(pass_node);
+            pass.subpasses.push(subpass);
+            editor.graph_mut()[node] = PlanNode::RenderPass(pass);
             Reduction::Changed
         }
     }
@@ -270,6 +272,7 @@ fn process_new_attachment<B: Backend, T: ?Sized>(
     ref_edge: &AttachmentRefEdge,
     subpass: &mut RenderPassSubpass<B, T>,
     subpass_index: usize,
+    deps: &mut SmallVec<[rendy_core::hal::pass::SubpassDependency; 32]>,
     ops: AttachmentOps,
     clear: AttachmentClear,
     attachment_index: usize,
@@ -288,24 +291,40 @@ fn process_new_attachment<B: Backend, T: ?Sized>(
         first_layout: attachment_ref.1,
     };
 
-    match ref_edge {
+    let flags = match ref_edge {
         AttachmentRefEdge::Color(id) => {
             subpass.set_color(*id, attachment_ref);
+            rendy_core::hal::memory::Dependencies::empty()
         }
         AttachmentRefEdge::Resolve(id) => {
             subpass.set_resolve(*id, attachment_ref);
+            rendy_core::hal::memory::Dependencies::empty()
         }
         AttachmentRefEdge::Input(id) => {
             subpass.set_input(*id, attachment_ref);
+            rendy_core::hal::memory::Dependencies::BY_REGION
         }
         AttachmentRefEdge::DepthStencil(_) => {
             subpass.set_depth_stencil(attachment_ref);
             attachment.stencil_ops = attachment.ops;
+            rendy_core::hal::memory::Dependencies::BY_REGION
         }
-    }
+    };
 
     let stages = ref_edge.stages();
     let accesses = ref_edge.accesses();
+
+    // TODO: what about accesses from previous stuff?
+    let prev_stages = stages;
+    let prev_accesses = accesses;
+
+    deps.push(rendy_core::hal::pass::SubpassDependency {
+        passes: rendy_core::hal::pass::SubpassRef::External
+            ..rendy_core::hal::pass::SubpassRef::Pass(subpass_index),
+        stages: prev_stages..stages,
+        accesses: prev_accesses..accesses,
+        flags,
+    });
 
     if ref_edge.is_write() {
         attachment.first_write = Some((subpass_index as _, stages, accesses));
@@ -323,53 +342,61 @@ fn process_existing_attachment<B: Backend, T: ?Sized>(
     ref_edge: &AttachmentRefEdge,
     subpass: &mut RenderPassSubpass<B, T>,
     subpass_index: usize,
-    deps: &mut SmallVec<[gfx_hal::pass::SubpassDependency; 32]>,
+    deps: &mut SmallVec<[rendy_core::hal::pass::SubpassDependency; 32]>,
     attachment: &mut RenderPassAtachment,
     attachment_index: usize,
 ) {
     let attachment_ref = (attachment_index, ref_edge.layout());
 
-    match ref_edge {
+    let flags = match ref_edge {
         AttachmentRefEdge::Color(id) => {
             subpass.set_color(*id, attachment_ref);
+            rendy_core::hal::memory::Dependencies::empty()
         }
         AttachmentRefEdge::Resolve(id) => {
             subpass.set_resolve(*id, attachment_ref);
+            rendy_core::hal::memory::Dependencies::empty()
         }
         AttachmentRefEdge::Input(id) => {
             subpass.set_input(*id, attachment_ref);
+            rendy_core::hal::memory::Dependencies::BY_REGION
         }
         AttachmentRefEdge::DepthStencil(_) => {
             subpass.set_depth_stencil(attachment_ref);
             attachment.stencil_ops = attachment.ops;
+            rendy_core::hal::memory::Dependencies::BY_REGION
         }
     };
 
     let stages = ref_edge.stages();
     let accesses = ref_edge.accesses();
     attachment.last_access = subpass_index as _;
+
+    if let Some((write_index, write_stages, write_accesses)) = attachment.last_write {
+        deps.push(rendy_core::hal::pass::SubpassDependency {
+            passes: rendy_core::hal::pass::SubpassRef::Pass(write_index as _)
+                ..rendy_core::hal::pass::SubpassRef::Pass(subpass_index),
+            stages: write_stages..stages,
+            accesses: write_accesses..accesses,
+            flags,
+        });
+    }
+
     if ref_edge.is_write() {
         attachment.last_write = Some((subpass_index as _, stages, accesses));
         if attachment.first_write.is_none() {
             attachment.first_write = attachment.last_write;
         }
         deps.extend(attachment.queued_reads.drain().map(
-            |(read_index, read_stages, read_accesses)| gfx_hal::pass::SubpassDependency {
-                passes: gfx_hal::pass::SubpassRef::Pass(read_index as _)
-                    ..gfx_hal::pass::SubpassRef::Pass(subpass_index),
+            |(read_index, read_stages, read_accesses)| rendy_core::hal::pass::SubpassDependency {
+                passes: rendy_core::hal::pass::SubpassRef::Pass(read_index as _)
+                    ..rendy_core::hal::pass::SubpassRef::Pass(subpass_index),
                 stages: read_stages..stages,
                 accesses: read_accesses..accesses,
+                flags,
             },
         ));
     } else {
-        if let Some((write_index, write_stages, write_accesses)) = attachment.last_write {
-            deps.push(gfx_hal::pass::SubpassDependency {
-                passes: gfx_hal::pass::SubpassRef::Pass(write_index as _)
-                    ..gfx_hal::pass::SubpassRef::Pass(subpass_index),
-                stages: write_stages..stages,
-                accesses: write_accesses..accesses,
-            });
-        }
         attachment
             .queued_reads
             .push((subpass_index as _, stages, accesses));

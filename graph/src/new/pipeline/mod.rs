@@ -4,9 +4,9 @@ use {
         graph_reducer::{GraphReducer, ReductionContext},
         walker::Topo,
     },
-    gfx_hal::Backend,
     graphy::{GraphAllocator, NodeIndex, Walker},
     purple::collections::{BitVec, Vec},
+    rendy_core::hal::Backend,
 };
 
 mod misc;
@@ -18,12 +18,20 @@ use misc::{CombineVersionsReducer, OrderWritesReducer};
 use pass::CombinePassesReducer;
 use subpass::CombineSubpassesReducer;
 
-#[derive(derivative::Derivative)]
-#[derivative(Debug(bound = ""))]
 pub(crate) struct Pipeline<B: Backend, T: ?Sized> {
     stage1: GraphReducer<B, T>,
     stage2: GraphReducer<B, T>,
     stage3: GraphReducer<B, T>,
+}
+
+impl<B: Backend, T: ?Sized> std::fmt::Debug for Pipeline<B, T> {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
+        fmt.debug_struct("Pipeline")
+            .field("stage1", &self.stage1)
+            .field("stage2", &self.stage2)
+            .field("stage3", &self.stage3)
+            .finish()
+    }
 }
 
 impl<B: Backend, T: ?Sized> Pipeline<B, T> {

@@ -4,8 +4,8 @@ use {
         graph_reducer::{GraphEditor, Reducer, Reduction},
         pipeline::node_ext::NodeExt,
     },
-    gfx_hal::Backend,
     graphy::{NodeIndex, Walker},
+    rendy_core::hal::Backend,
 };
 
 #[derive(Debug)]

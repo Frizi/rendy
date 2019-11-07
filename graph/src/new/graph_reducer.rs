@@ -1,7 +1,7 @@
 use super::graph::{PlanDag, PlanEdge, PlanNode};
 use super::pipeline::Contributions;
-use gfx_hal::Backend;
 use graphy::{Direction, EdgeIndex, GraphAllocator, GraphError, NodeIndex, Walker};
+use rendy_core::hal::Backend;
 #[derive(Debug)]
 pub enum Reduction {
     /// Reduction have no effect
@@ -57,11 +57,18 @@ impl NodeProgress {
 
 type Reducers<B, T> = Vec<Box<dyn Reducer<B, T> + 'static>>;
 
-#[derive(derivative::Derivative)]
-#[derivative(Debug(bound = ""))]
 pub struct GraphReducer<B: Backend, T: ?Sized> {
     reducers: Reducers<B, T>,
     state: ReductionState,
+}
+
+impl<B: Backend, T: ?Sized> std::fmt::Debug for GraphReducer<B, T> {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
+        fmt.debug_struct("GraphReducer")
+            .field("reducers", &self.reducers)
+            .field("state", &self.state)
+            .finish()
+    }
 }
 
 #[derive(Debug)]

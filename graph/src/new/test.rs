@@ -2,16 +2,16 @@
     feature = "empty",
     not(any(feature = "dx12", feature = "metal", feature = "vulkan"))
 ))]
-pub(crate) use rendy_util::empty::Backend as TestBackend;
+pub(crate) use rendy_core::empty::Backend as TestBackend;
 
 #[cfg(all(feature = "vulkan", not(any(feature = "dx12", feature = "metal"))))]
-pub(crate) use rendy_util::vulkan::Backend as TestBackend;
+pub(crate) use rendy_core::vulkan::Backend as TestBackend;
 
 #[cfg(all(feature = "metal", not(any(feature = "dx12"))))]
-pub(crate) use rendy_util::metal::Backend as TestBackend;
+pub(crate) use rendy_core::metal::Backend as TestBackend;
 
 #[cfg(all(feature = "dx12"))]
-pub(crate) use rendy_util::dx12::Backend as TestBackend;
+pub(crate) use rendy_core::dx12::Backend as TestBackend;
 
 use crate::new::graph::PlanDag;
 
@@ -111,7 +111,7 @@ pub fn assert_equivalent<A: std::fmt::Debug, B: PartialEq + std::fmt::Debug>(
     assert_eq!(expected_topo, actual_topo);
 }
 
-pub(crate) fn visualize_graph<B: gfx_hal::Backend, T: ?Sized>(
+pub(crate) fn visualize_graph<B: rendy_core::hal::Backend, T: ?Sized>(
     write: &mut impl std::io::Write,
     graph: &PlanDag<B, T>,
     name: &str,
@@ -119,9 +119,12 @@ pub(crate) fn visualize_graph<B: gfx_hal::Backend, T: ?Sized>(
     use crate::new::graph::{PlanEdge, PlanNode};
     use graphy::{EdgeIndex, NodeIndex};
 
-    struct Visualize<'a, 'r, 'b, B: gfx_hal::Backend, T: ?Sized>(&'b PlanDag<'r, 'a, B, T>, String);
+    struct Visualize<'a, 'r, 'b, B: rendy_core::hal::Backend, T: ?Sized>(
+        &'b PlanDag<'r, 'a, B, T>,
+        String,
+    );
 
-    impl<'a, 'r, 'b, B: gfx_hal::Backend, T: ?Sized> Visualize<'a, 'r, 'b, B, T> {
+    impl<'a, 'r, 'b, B: rendy_core::hal::Backend, T: ?Sized> Visualize<'a, 'r, 'b, B, T> {
         fn edge_color(&self, index: EdgeIndex) -> &'static str {
             match self.0.get_edge(index).unwrap() {
                 PlanEdge::Effect => "#d119bf",
@@ -218,7 +221,7 @@ pub(crate) fn visualize_graph<B: gfx_hal::Backend, T: ?Sized>(
         }
     }
 
-    impl<'a, 'r, 'b, B: gfx_hal::Backend, T: ?Sized> dot::Labeller<'b, Item, Edge>
+    impl<'a, 'r, 'b, B: rendy_core::hal::Backend, T: ?Sized> dot::Labeller<'b, Item, Edge>
         for Visualize<'a, 'r, 'b, B, T>
     {
         fn graph_id(&'b self) -> dot::Id<'b> {
@@ -297,7 +300,7 @@ pub(crate) fn visualize_graph<B: gfx_hal::Backend, T: ?Sized>(
         }
     }
 
-    impl<'a, 'r, 'b, B: gfx_hal::Backend, T: ?Sized> dot::GraphWalk<'b, Item, Edge>
+    impl<'a, 'r, 'b, B: rendy_core::hal::Backend, T: ?Sized> dot::GraphWalk<'b, Item, Edge>
         for Visualize<'a, 'r, 'b, B, T>
     {
         fn nodes(&'b self) -> dot::Nodes<'b, Item> {

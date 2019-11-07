@@ -1,7 +1,7 @@
 use super::node::NodeId;
 use crate::new::node::NodeConstructionError;
 use bitflags::bitflags;
-use gfx_hal::pso::PipelineStage;
+use rendy_core::hal::pso::PipelineStage;
 
 /// Id of the buffer in graph.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -22,16 +22,16 @@ pub enum ImageLoad {
     /// Use image contents generated in previous frame.
     /// When the image is used for the first time in a series of frames, the clear operation is used instead.
     /// Specify a node-scoped stable unique identifier to link it with the contents from previous frame.
-    Retain(usize, gfx_hal::command::ClearValue),
+    Retain(usize, rendy_core::hal::command::ClearValue),
     /// Clear the image with specified value when using it for the first time in the render pipeline.
-    Clear(gfx_hal::command::ClearValue),
+    Clear(rendy_core::hal::command::ClearValue),
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct ImageInfo {
-    pub kind: gfx_hal::image::Kind,
-    pub levels: gfx_hal::image::Level,
-    pub format: gfx_hal::format::Format,
+    pub kind: rendy_core::hal::image::Kind,
+    pub levels: rendy_core::hal::image::Level,
+    pub format: rendy_core::hal::format::Format,
     /// Specify how the image is being loaded when used for the first time in the frame
     pub load: ImageLoad,
 }
@@ -117,6 +117,51 @@ impl NodeImageAccess {
 
     pub fn is_write(&self) -> bool {
         !self.writes().is_empty()
+    }
+
+    pub fn layout(&self) -> rendy_core::hal::image::Layout {
+        use rendy_core::hal::image::Layout;
+        let mut acc = None;
+        if self.contains(Self::INPUT_ATTACHMENT_READ) {
+            acc = Some(common_layout(acc, Layout::ShaderReadOnlyOptimal));
+        }
+        if self.contains(Self::COLOR_ATTACHMENT_READ) {
+            acc = Some(common_layout(acc, Layout::ColorAttachmentOptimal));
+        }
+        if self.contains(Self::COLOR_ATTACHMENT_WRITE) {
+            acc = Some(common_layout(acc, Layout::ColorAttachmentOptimal));
+        }
+        if self.contains(Self::DEPTH_STENCIL_ATTACHMENT_READ) {
+            acc = Some(common_layout(acc, Layout::DepthStencilReadOnlyOptimal));
+        }
+        if self.contains(Self::DEPTH_STENCIL_ATTACHMENT_WRITE) {
+            acc = Some(common_layout(acc, Layout::DepthStencilAttachmentOptimal));
+        }
+        if self.contains(Self::TRANSFER_READ) {
+            acc = Some(common_layout(acc, Layout::TransferSrcOptimal));
+        }
+        if self.contains(Self::TRANSFER_WRITE) {
+            acc = Some(common_layout(acc, Layout::TransferDstOptimal));
+        }
+        acc.unwrap_or(Layout::General)
+    }
+}
+
+fn common_layout(
+    acc: Option<rendy_core::hal::image::Layout>,
+    layout: rendy_core::hal::image::Layout,
+) -> rendy_core::hal::image::Layout {
+    use rendy_core::hal::image::Layout;
+    match (acc, layout) {
+        (None, layout) => layout,
+        (Some(left), right) if left == right => left,
+        (Some(Layout::DepthStencilReadOnlyOptimal), Layout::DepthStencilAttachmentOptimal) => {
+            Layout::DepthStencilAttachmentOptimal
+        }
+        (Some(Layout::DepthStencilAttachmentOptimal), Layout::DepthStencilReadOnlyOptimal) => {
+            Layout::DepthStencilAttachmentOptimal
+        }
+        (Some(_), _) => Layout::General,
     }
 }
 
@@ -254,6 +299,7 @@ impl ResourceUsage {
         Ok(())
     }
 }
+
 impl ResourceAccess {
     pub(crate) fn is_empty(&self) -> bool {
         match self {

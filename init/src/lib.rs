@@ -16,6 +16,30 @@ use {
     rendy_factory::{Config, DevicesConfigure, Factory, HeapsConfigure, QueuesConfigure},
 };
 
+// reexport for macros
+#[doc(hidden)]
+pub use rendy_core::rendy_backend as _core_rendy_backend;
+
+/// Init rendy and execute code based on chosen backend
+#[macro_export]
+macro_rules! with_any_rendy {
+    (($rendy:expr) $(use $back:ident;)?($factory:pat, $families:pat) => $code:block) => {{
+        $crate::_core_rendy_backend!(match ($rendy): $crate::AnyRendy {
+            $(use $back;)?_($crate::Rendy { factory: $factory, families: $families }) => { $code }
+        })
+    }}
+}
+
+/// Init rendy and execute code based on chosen backend
+#[macro_export]
+macro_rules! with_any_windowed_rendy {
+    (($rendy:expr) $(use $back:ident;)? ($factory:pat, $families:pat, $surface:pat, $window:pat) => $code:block) => {{
+        $crate::_core_rendy_backend!(match ($rendy): $crate::AnyWindowedRendy {
+            $(use $back;)?_($crate::WindowedRendy { factory: $factory, families: $families, surface: $surface, window: $window }) => { $code }
+        })
+    }}
+}
+
 #[cfg(feature = "winit")]
 mod windowed;
 
@@ -86,8 +110,8 @@ impl<B: Backend> Rendy<B> {
 /// Error type that may be returned by `AnyRendy::init_auto`
 pub struct RendyAutoInitError {
     pub errors: Vec<(EnabledBackend, RendyInitError)>,
-}
 
+}
 impl std::fmt::Debug for RendyAutoInitError {
     fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Display::fmt(self, fmt)

@@ -18,17 +18,32 @@ use {
         factory::Factory,
         resource::{Handle, Image},
     },
-    gfx_hal::{pass::ATTACHMENT_UNUSED, Backend},
     graphy::{EdgeIndex, GraphAllocator, NodeIndex, Walker},
+    rendy_core::hal::{pass::ATTACHMENT_UNUSED, Backend},
     smallvec::{smallvec, SmallVec},
     std::{any::Any, collections::HashMap, marker::PhantomData, ops::Range},
 };
 /// A builder type for rendering graph.
-#[derive(derivative::Derivative)]
-#[derivative(Default(bound = ""), Debug(bound = ""))]
 pub struct GraphBuilder<B: Backend, T: ?Sized> {
     nodes: Vec<Box<dyn DynNodeBuilder<B, T>>>,
 }
+
+impl<B: Backend, T: ?Sized> Default for GraphBuilder<B, T> {
+    fn default() -> Self {
+        Self {
+            nodes: Vec::default(),
+        }
+    }
+}
+
+impl<B: Backend, T: ?Sized> std::fmt::Debug for GraphBuilder<B, T> {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
+        fmt.debug_struct("GraphBuilder")
+            .field("nodes", &self.nodes)
+            .finish()
+    }
+}
+
 /// Error that happened during graph building.
 #[derive(Debug)]
 pub enum GraphBuildError {
@@ -76,17 +91,29 @@ impl<B: Backend, T: ?Sized> GraphBuilder<B, T> {
     }
 }
 /// A built runnable top-level rendering graph.
-#[derive(derivative::Derivative)]
-#[derivative(Debug(bound = ""))]
 pub struct Graph<B: Backend, T: ?Sized> {
     nodes: GraphNodes<B, T>,
     pipeline: Pipeline<B, T>,
     alloc: GraphAllocator,
 }
 
-#[derive(derivative::Derivative)]
-#[derivative(Debug(bound = ""))]
+impl<B: Backend, T: ?Sized> std::fmt::Debug for Graph<B, T> {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
+        fmt.debug_struct("Graph")
+            .field("nodes", &self.nodes)
+            .field("pipeline", &self.pipeline)
+            .field("alloc", &self.alloc)
+            .finish()
+    }
+}
+
 struct GraphNodes<B: Backend, T: ?Sized>(Vec<Box<dyn DynNode<B, T>>>);
+
+impl<B: Backend, T: ?Sized> std::fmt::Debug for GraphNodes<B, T> {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
+        fmt.debug_list().entries(self.0.iter()).finish()
+    }
+}
 
 impl<B: Backend, T: ?Sized> Graph<B, T> {
     /// Construct, schedule and run all nodes of rendering graph.
@@ -420,9 +447,9 @@ impl<'run, B: Backend, T: ?Sized> NodeCtx<'run, B, T> for NodeContext<'_, 'run, 
 pub(crate) struct ImageNode {
     // The ID is only used to later retreive the image in execution phase
     pub(crate) id: ImageId,
-    pub(crate) kind: gfx_hal::image::Kind,
-    pub(crate) levels: gfx_hal::image::Level,
-    pub(crate) format: gfx_hal::format::Format,
+    pub(crate) kind: rendy_core::hal::image::Kind,
+    pub(crate) levels: rendy_core::hal::image::Level,
+    pub(crate) format: rendy_core::hal::format::Format,
 }
 
 #[derive(Debug, Clone)]
@@ -441,7 +468,7 @@ pub(crate) enum PlanNode<'n, B: Backend, T: ?Sized> {
     ImageVersion,
     BufferVersion,
     /// Image clear operation
-    ClearImage(gfx_hal::command::ClearValue),
+    ClearImage(rendy_core::hal::command::ClearValue),
     /// Buffer clear operation
     ClearBuffer(u32),
     /// Load image rendered in previous frame
@@ -507,48 +534,60 @@ impl AttachmentRefEdge {
         }
     }
     #[inline]
-    pub(crate) fn layout(&self) -> gfx_hal::image::Layout {
+    pub(crate) fn layout(&self) -> rendy_core::hal::image::Layout {
         match self {
-            AttachmentRefEdge::Color(..) => gfx_hal::image::Layout::ColorAttachmentOptimal,
-            AttachmentRefEdge::Resolve(..) => gfx_hal::image::Layout::ColorAttachmentOptimal,
-            AttachmentRefEdge::Input(..) => gfx_hal::image::Layout::ShaderReadOnlyOptimal,
+            AttachmentRefEdge::Color(..) => rendy_core::hal::image::Layout::ColorAttachmentOptimal,
+            AttachmentRefEdge::Resolve(..) => {
+                rendy_core::hal::image::Layout::ColorAttachmentOptimal
+            }
+            AttachmentRefEdge::Input(..) => rendy_core::hal::image::Layout::ShaderReadOnlyOptimal,
             AttachmentRefEdge::DepthStencil(access) => match access {
-                AttachmentAccess::ReadOnly => gfx_hal::image::Layout::DepthStencilReadOnlyOptimal,
+                AttachmentAccess::ReadOnly => {
+                    rendy_core::hal::image::Layout::DepthStencilReadOnlyOptimal
+                }
                 AttachmentAccess::ReadWrite => {
-                    gfx_hal::image::Layout::DepthStencilAttachmentOptimal
+                    rendy_core::hal::image::Layout::DepthStencilAttachmentOptimal
                 }
             },
         }
     }
     #[inline]
-    pub(crate) fn accesses(&self) -> gfx_hal::image::Access {
+    pub(crate) fn accesses(&self) -> rendy_core::hal::image::Access {
         match self {
             AttachmentRefEdge::Color(..) => {
-                gfx_hal::image::Access::COLOR_ATTACHMENT_READ
-                    | gfx_hal::image::Access::COLOR_ATTACHMENT_WRITE
+                rendy_core::hal::image::Access::COLOR_ATTACHMENT_READ
+                    | rendy_core::hal::image::Access::COLOR_ATTACHMENT_WRITE
             }
-            AttachmentRefEdge::Resolve(..) => gfx_hal::image::Access::COLOR_ATTACHMENT_WRITE,
-            AttachmentRefEdge::Input(..) => gfx_hal::image::Access::INPUT_ATTACHMENT_READ,
+            AttachmentRefEdge::Resolve(..) => {
+                rendy_core::hal::image::Access::COLOR_ATTACHMENT_WRITE
+            }
+            AttachmentRefEdge::Input(..) => rendy_core::hal::image::Access::INPUT_ATTACHMENT_READ,
             AttachmentRefEdge::DepthStencil(access) => match access {
-                AttachmentAccess::ReadOnly => gfx_hal::image::Access::DEPTH_STENCIL_ATTACHMENT_READ,
+                AttachmentAccess::ReadOnly => {
+                    rendy_core::hal::image::Access::DEPTH_STENCIL_ATTACHMENT_READ
+                }
                 AttachmentAccess::ReadWrite => {
-                    gfx_hal::image::Access::DEPTH_STENCIL_ATTACHMENT_READ
-                        | gfx_hal::image::Access::DEPTH_STENCIL_ATTACHMENT_WRITE
+                    rendy_core::hal::image::Access::DEPTH_STENCIL_ATTACHMENT_READ
+                        | rendy_core::hal::image::Access::DEPTH_STENCIL_ATTACHMENT_WRITE
                 }
             },
         }
     }
     #[inline]
-    pub(crate) fn stages(&self) -> gfx_hal::pso::PipelineStage {
+    pub(crate) fn stages(&self) -> rendy_core::hal::pso::PipelineStage {
         match self {
             // TODO: can it be declared if color is used as write-only?
-            AttachmentRefEdge::Color(..) => gfx_hal::pso::PipelineStage::COLOR_ATTACHMENT_OUTPUT,
-            AttachmentRefEdge::Resolve(..) => gfx_hal::pso::PipelineStage::COLOR_ATTACHMENT_OUTPUT,
-            AttachmentRefEdge::Input(..) => gfx_hal::pso::PipelineStage::FRAGMENT_SHADER,
+            AttachmentRefEdge::Color(..) => {
+                rendy_core::hal::pso::PipelineStage::COLOR_ATTACHMENT_OUTPUT
+            }
+            AttachmentRefEdge::Resolve(..) => {
+                rendy_core::hal::pso::PipelineStage::COLOR_ATTACHMENT_OUTPUT
+            }
+            AttachmentRefEdge::Input(..) => rendy_core::hal::pso::PipelineStage::FRAGMENT_SHADER,
             AttachmentRefEdge::DepthStencil(_) => {
                 // TODO: can it be declared which fragment test is used?
-                gfx_hal::pso::PipelineStage::EARLY_FRAGMENT_TESTS
-                    | gfx_hal::pso::PipelineStage::LATE_FRAGMENT_TESTS
+                rendy_core::hal::pso::PipelineStage::EARLY_FRAGMENT_TESTS
+                    | rendy_core::hal::pso::PipelineStage::LATE_FRAGMENT_TESTS
             }
         }
     }
@@ -556,10 +595,10 @@ impl AttachmentRefEdge {
 
 pub(crate) struct RenderPassSubpass<'n, B: Backend, T: ?Sized> {
     pub(crate) groups: SmallVec<[(NodeId, PassFn<'n, B, T>); 4]>,
-    pub(crate) colors: SmallVec<[gfx_hal::pass::AttachmentRef; 8]>,
-    pub(crate) inputs: SmallVec<[gfx_hal::pass::AttachmentRef; 8]>,
-    pub(crate) resolves: SmallVec<[gfx_hal::pass::AttachmentRef; 4]>,
-    pub(crate) depth_stencil: gfx_hal::pass::AttachmentRef,
+    pub(crate) colors: SmallVec<[rendy_core::hal::pass::AttachmentRef; 8]>,
+    pub(crate) inputs: SmallVec<[rendy_core::hal::pass::AttachmentRef; 8]>,
+    pub(crate) resolves: SmallVec<[rendy_core::hal::pass::AttachmentRef; 4]>,
+    pub(crate) depth_stencil: rendy_core::hal::pass::AttachmentRef,
 }
 
 impl<'n, B: Backend, T: ?Sized> std::fmt::Debug for RenderPassSubpass<'n, B, T> {
@@ -580,18 +619,18 @@ impl<'n, B: Backend, T: ?Sized> RenderPassSubpass<'n, B, T> {
             colors: SmallVec::new(),
             inputs: SmallVec::new(),
             resolves: SmallVec::new(),
-            depth_stencil: (ATTACHMENT_UNUSED, gfx_hal::image::Layout::Undefined),
+            depth_stencil: (ATTACHMENT_UNUSED, rendy_core::hal::image::Layout::Undefined),
         }
     }
     pub(crate) fn set_color(
         &mut self,
         ref_index: usize,
-        attachment_ref: gfx_hal::pass::AttachmentRef,
+        attachment_ref: rendy_core::hal::pass::AttachmentRef,
     ) {
         if self.colors.len() <= ref_index {
             self.colors.resize(
                 ref_index + 1,
-                (ATTACHMENT_UNUSED, gfx_hal::image::Layout::Undefined),
+                (ATTACHMENT_UNUSED, rendy_core::hal::image::Layout::Undefined),
             );
         }
         self.colors[ref_index] = attachment_ref;
@@ -599,12 +638,12 @@ impl<'n, B: Backend, T: ?Sized> RenderPassSubpass<'n, B, T> {
     pub(crate) fn set_resolve(
         &mut self,
         ref_index: usize,
-        attachment_ref: gfx_hal::pass::AttachmentRef,
+        attachment_ref: rendy_core::hal::pass::AttachmentRef,
     ) {
         if self.resolves.len() <= ref_index {
             self.resolves.resize(
                 ref_index + 1,
-                (ATTACHMENT_UNUSED, gfx_hal::image::Layout::Undefined),
+                (ATTACHMENT_UNUSED, rendy_core::hal::image::Layout::Undefined),
             );
         }
         self.colors[ref_index] = attachment_ref;
@@ -612,17 +651,20 @@ impl<'n, B: Backend, T: ?Sized> RenderPassSubpass<'n, B, T> {
     pub(crate) fn set_input(
         &mut self,
         ref_index: usize,
-        attachment_ref: gfx_hal::pass::AttachmentRef,
+        attachment_ref: rendy_core::hal::pass::AttachmentRef,
     ) {
         if self.inputs.len() <= ref_index {
             self.inputs.resize(
                 ref_index + 1,
-                (ATTACHMENT_UNUSED, gfx_hal::image::Layout::Undefined),
+                (ATTACHMENT_UNUSED, rendy_core::hal::image::Layout::Undefined),
             );
         }
         self.inputs[ref_index] = attachment_ref;
     }
-    pub(crate) fn set_depth_stencil(&mut self, attachment_ref: gfx_hal::pass::AttachmentRef) {
+    pub(crate) fn set_depth_stencil(
+        &mut self,
+        attachment_ref: rendy_core::hal::pass::AttachmentRef,
+    ) {
         self.depth_stencil = attachment_ref;
     }
 }
@@ -630,7 +672,7 @@ impl<'n, B: Backend, T: ?Sized> RenderPassSubpass<'n, B, T> {
 #[derive(Debug)]
 pub(crate) struct RenderPassNode<'n, B: Backend, T: ?Sized> {
     pub(crate) subpasses: SmallVec<[RenderPassSubpass<'n, B, T>; 4]>,
-    pub(crate) deps: SmallVec<[gfx_hal::pass::SubpassDependency; 32]>,
+    pub(crate) deps: SmallVec<[rendy_core::hal::pass::SubpassDependency; 32]>,
 }
 
 impl<'n, B: Backend, T: ?Sized> RenderPassNode<'n, B, T> {
@@ -649,16 +691,29 @@ impl<'n, B: Backend, T: ?Sized> RenderPassNode<'n, B, T> {
 // Same thing can be a color and an input (or even a resolve) for two different subpasses.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RenderPassAtachment {
-    pub(crate) ops: gfx_hal::pass::AttachmentOps,
-    pub(crate) stencil_ops: gfx_hal::pass::AttachmentOps,
+    pub(crate) ops: rendy_core::hal::pass::AttachmentOps,
+    pub(crate) stencil_ops: rendy_core::hal::pass::AttachmentOps,
     pub(crate) clear: AttachmentClear,
     pub(crate) first_access: u8,
     pub(crate) last_access: u8,
-    pub(crate) first_write: Option<(u8, gfx_hal::pso::PipelineStage, gfx_hal::image::Access)>,
-    pub(crate) last_write: Option<(u8, gfx_hal::pso::PipelineStage, gfx_hal::image::Access)>,
-    pub(crate) queued_reads:
-        SmallVec<[(u8, gfx_hal::pso::PipelineStage, gfx_hal::image::Access); 4]>,
-    pub(crate) first_layout: gfx_hal::image::Layout,
+    pub(crate) first_write: Option<(
+        u8,
+        rendy_core::hal::pso::PipelineStage,
+        rendy_core::hal::image::Access,
+    )>,
+    pub(crate) last_write: Option<(
+        u8,
+        rendy_core::hal::pso::PipelineStage,
+        rendy_core::hal::image::Access,
+    )>,
+    pub(crate) queued_reads: SmallVec<
+        [(
+            u8,
+            rendy_core::hal::pso::PipelineStage,
+            rendy_core::hal::image::Access,
+        ); 4],
+    >,
+    pub(crate) first_layout: rendy_core::hal::image::Layout,
 }
 
 impl RenderPassAtachment {
@@ -668,7 +723,7 @@ impl RenderPassAtachment {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct AttachmentClear(pub(crate) Option<gfx_hal::command::ClearValue>);
+pub(crate) struct AttachmentClear(pub(crate) Option<rendy_core::hal::command::ClearValue>);
 
 impl Eq for AttachmentClear {}
 impl PartialEq for AttachmentClear {
@@ -707,8 +762,8 @@ pub(crate) enum PlanEdge {
     AttachmentRef(AttachmentRefEdge),
     PassAttachment(RenderPassAtachment),
     /// Target node accesses connected source image version.
-    BufferAccess(NodeBufferAccess, gfx_hal::pso::PipelineStage),
-    ImageAccess(NodeImageAccess, gfx_hal::pso::PipelineStage),
+    BufferAccess(NodeBufferAccess, rendy_core::hal::pso::PipelineStage),
+    ImageAccess(NodeImageAccess, rendy_core::hal::pso::PipelineStage),
     /// A node-to-node execution order dependency
     Effect,
     /// Resource version relation. Version increases in the edge direction
@@ -1245,29 +1300,29 @@ mod test {
         new::{
             node::ConstructResult,
             resources::ShaderUsage,
-            test::{test_init, visualize_graph, TestBackend},
+            test::{test_init, visualize_graph},
         },
     };
 
-    impl NodeBuilder<TestBackend, ()> for ImageInfo {
+    impl<B: Backend> NodeBuilder<B, ()> for ImageInfo {
         type Node = Self;
         type Family = crate::command::Transfer;
         fn build(
             self: Box<Self>,
-            _: &mut Factory<TestBackend>,
-            _: &mut Family<TestBackend>,
+            _: &mut Factory<B>,
+            _: &mut Family<B>,
             _: &(),
         ) -> Result<Self::Node, NodeBuildError> {
             Ok(*self)
         }
     }
 
-    impl Node<TestBackend, ()> for ImageInfo {
+    impl<B: Backend> Node<B, ()> for ImageInfo {
         type Outputs = Parameter<ImageId>;
         fn construct<'run>(
             &'run mut self,
-            ctx: &mut impl NodeCtx<'run, TestBackend, ()>,
-        ) -> ConstructResult<'run, Self, TestBackend, ()> {
+            ctx: &mut impl NodeCtx<'run, B, ()>,
+        ) -> ConstructResult<'run, Self, B, ()> {
             let image = ctx.create_image(*self);
             Ok((image, NodeExecution::None))
         }
@@ -1285,26 +1340,26 @@ mod test {
         }
     }
 
-    impl NodeBuilder<TestBackend, ()> for TestPass {
+    impl<B: Backend> NodeBuilder<B, ()> for TestPass {
         type Node = Self;
         type Family = crate::command::Graphics;
         fn build(
             self: Box<Self>,
-            _: &mut Factory<TestBackend>,
-            _: &mut Family<TestBackend>,
+            _: &mut Factory<B>,
+            _: &mut Family<B>,
             _: &(),
         ) -> Result<Self::Node, NodeBuildError> {
             Ok(*self)
         }
     }
 
-    impl Node<TestBackend, ()> for TestPass {
+    impl<B: Backend> Node<B, ()> for TestPass {
         type Outputs = ();
 
         fn construct<'run>(
             &'run mut self,
-            ctx: &mut impl NodeCtx<'run, TestBackend, ()>,
-        ) -> ConstructResult<'run, Self, TestBackend, ()> {
+            ctx: &mut impl NodeCtx<'run, B, ()>,
+        ) -> ConstructResult<'run, Self, B, ()> {
             let color = *ctx.get_parameter(self.color)?;
             ctx.use_color(0, color)?;
             if let Some(depth) = self.depth {
@@ -1337,26 +1392,26 @@ mod test {
         }
     }
 
-    impl NodeBuilder<TestBackend, ()> for TestPass2 {
+    impl<B: Backend> NodeBuilder<B, ()> for TestPass2 {
         type Node = Self;
         type Family = crate::command::Graphics;
         fn build(
             self: Box<Self>,
-            _: &mut Factory<TestBackend>,
-            _: &mut Family<TestBackend>,
+            _: &mut Factory<B>,
+            _: &mut Family<B>,
             _: &(),
         ) -> Result<Self::Node, NodeBuildError> {
             Ok(*self)
         }
     }
 
-    impl Node<TestBackend, ()> for TestPass2 {
+    impl<B: Backend> Node<B, ()> for TestPass2 {
         type Outputs = ();
 
         fn construct<'run>(
             &'run mut self,
-            ctx: &mut impl NodeCtx<'run, TestBackend, ()>,
-        ) -> ConstructResult<'run, Self, TestBackend, ()> {
+            ctx: &mut impl NodeCtx<'run, B, ()>,
+        ) -> ConstructResult<'run, Self, B, ()> {
             if let Some(color1) = self.color1 {
                 let color1 = *ctx.get_parameter(color1)?;
                 ctx.use_color(0, color1)?;
@@ -1385,26 +1440,26 @@ mod test {
         }
     }
 
-    impl NodeBuilder<TestBackend, ()> for TestCompute1 {
+    impl<B: Backend> NodeBuilder<B, ()> for TestCompute1 {
         type Node = Self;
         type Family = crate::command::Graphics;
         fn build(
             self: Box<Self>,
-            _: &mut Factory<TestBackend>,
-            _: &mut Family<TestBackend>,
+            _: &mut Factory<B>,
+            _: &mut Family<B>,
             _: &(),
         ) -> Result<Self::Node, NodeBuildError> {
             Ok(*self)
         }
     }
 
-    impl Node<TestBackend, ()> for TestCompute1 {
+    impl<B: Backend> Node<B, ()> for TestCompute1 {
         type Outputs = Parameter<BufferId>;
 
         fn construct<'run>(
             &'run mut self,
-            ctx: &mut impl NodeCtx<'run, TestBackend, ()>,
-        ) -> ConstructResult<'run, Self, TestBackend, ()> {
+            ctx: &mut impl NodeCtx<'run, B, ()>,
+        ) -> ConstructResult<'run, Self, B, ()> {
             let buf_id = ctx.create_buffer(BufferInfo {
                 size: 1,
                 clear: None,
@@ -1444,26 +1499,26 @@ mod test {
         }
     }
 
-    impl NodeBuilder<TestBackend, ()> for TestPass3 {
+    impl<B: Backend> NodeBuilder<B, ()> for TestPass3 {
         type Node = Self;
         type Family = crate::command::Graphics;
         fn build(
             self: Box<Self>,
-            _: &mut Factory<TestBackend>,
-            _: &mut Family<TestBackend>,
+            _: &mut Factory<B>,
+            _: &mut Family<B>,
             _: &(),
         ) -> Result<Self::Node, NodeBuildError> {
             Ok(*self)
         }
     }
 
-    impl Node<TestBackend, ()> for TestPass3 {
+    impl<B: Backend> Node<B, ()> for TestPass3 {
         type Outputs = ();
 
         fn construct<'run>(
             &'run mut self,
-            ctx: &mut impl NodeCtx<'run, TestBackend, ()>,
-        ) -> ConstructResult<'run, Self, TestBackend, ()> {
+            ctx: &mut impl NodeCtx<'run, B, ()>,
+        ) -> ConstructResult<'run, Self, B, ()> {
             let color = *ctx.get_parameter(self.color)?;
             let buffer = *ctx.get_parameter(self.buffer)?;
 
@@ -1481,29 +1536,29 @@ mod test {
     #[derive(Debug)]
     struct TestOutput;
 
-    impl NodeBuilder<TestBackend, ()> for TestOutput {
+    impl<B: Backend> NodeBuilder<B, ()> for TestOutput {
         type Node = Self;
         type Family = crate::command::Graphics;
         fn build(
             self: Box<Self>,
-            _: &mut Factory<TestBackend>,
-            _: &mut Family<TestBackend>,
+            _: &mut Factory<B>,
+            _: &mut Family<B>,
             _: &(),
         ) -> Result<Self::Node, NodeBuildError> {
             Ok(*self)
         }
     }
 
-    impl Node<TestBackend, ()> for TestOutput {
+    impl<B: Backend> Node<B, ()> for TestOutput {
         type Outputs = Parameter<ImageId>;
         fn construct<'run>(
             &'run mut self,
-            ctx: &mut impl NodeCtx<'run, TestBackend, ()>,
-        ) -> ConstructResult<'run, Self, TestBackend, ()> {
+            ctx: &mut impl NodeCtx<'run, B, ()>,
+        ) -> ConstructResult<'run, Self, B, ()> {
             let output = ctx.create_image(ImageInfo {
-                kind: gfx_hal::image::Kind::D2(1024, 1024, 1, 1),
+                kind: rendy_core::hal::image::Kind::D2(1024, 1024, 1, 1),
                 levels: 1,
-                format: gfx_hal::format::Format::Rgba8Unorm,
+                format: rendy_core::hal::format::Format::Rgba8Unorm,
                 load: ImageLoad::DontCare,
             });
             let output_use = ctx.use_image(output, ImageUsage::ColorAttachmentRead)?;
@@ -1522,67 +1577,71 @@ mod test {
         test_init();
 
         let config: crate::factory::Config = Default::default();
-        let (mut factory, mut families): (Factory<TestBackend>, _) =
-            crate::factory::init(config).unwrap();
+        let initialized = rendy_init::AnyRendy::init_auto(&config).unwrap();
 
-        let mut builder = GraphBuilder::new();
+        rendy_init::with_any_rendy!((initialized)
+            (mut factory, mut families) => {
+                let mut builder = GraphBuilder::new();
 
-        let depth = builder.add(ImageInfo {
-            kind: gfx_hal::image::Kind::D2(1, 1, 1, 1),
-            levels: 1,
-            format: gfx_hal::format::Format::R32Sfloat,
-            load: ImageLoad::Clear(gfx_hal::command::ClearValue {
-                depth_stencil: gfx_hal::command::ClearDepthStencil {
-                    depth: 0.0,
-                    stencil: 0,
-                },
-            }),
-        });
-        let depth2 = builder.add(ImageInfo {
-            kind: gfx_hal::image::Kind::D2(1, 1, 1, 1),
-            levels: 1,
-            format: gfx_hal::format::Format::R32Sfloat,
-            load: ImageLoad::DontCare,
-        });
-        let color2 = builder.add(ImageInfo {
-            kind: gfx_hal::image::Kind::D2(1, 1, 1, 1),
-            levels: 1,
-            format: gfx_hal::format::Format::Rgba8Unorm,
-            load: ImageLoad::DontCare,
-        });
-        let color = builder.add(TestOutput);
-        builder.add(TestPass2::new(Some(color2), None, None));
-        builder.add(TestPass2::new(Some(color), Some(color2), None));
-        builder.add(TestPass::new(color, Some(depth)));
-        let buf1 = builder.add(TestCompute1::new(Some(color)));
-        builder.add(TestPass::new(color2, Some(depth2)));
-        builder.add(TestPass3::new(color, buf1, false));
-        builder.add(TestPass3::new(color, buf1, true));
-        builder.add(TestPass2::new(Some(color2), Some(color), None));
-        builder.add(TestPass2::new(Some(color), Some(color2), None));
-        builder.add(TestPass2::new(Some(color), Some(color2), Some(depth2)));
-        builder.add(TestPass::new(color, Some(depth)));
-        builder.add(TestPass::new(color, None));
+                let depth = builder.add(ImageInfo {
+                    kind: rendy_core::hal::image::Kind::D2(1, 1, 1, 1),
+                    levels: 1,
+                    format: rendy_core::hal::format::Format::R32Sfloat,
+                    load: ImageLoad::Clear(rendy_core::hal::command::ClearValue {
+                        depth_stencil: rendy_core::hal::command::ClearDepthStencil {
+                            depth: 0.0,
+                            stencil: 0,
+                        },
+                    }),
+                });
+                let depth2 = builder.add(ImageInfo {
+                    kind: rendy_core::hal::image::Kind::D2(1, 1, 1, 1),
+                    levels: 1,
+                    format: rendy_core::hal::format::Format::R32Sfloat,
+                    load: ImageLoad::DontCare,
+                });
+                let color2 = builder.add(ImageInfo {
+                    kind: rendy_core::hal::image::Kind::D2(1, 1, 1, 1),
+                    levels: 1,
+                    format: rendy_core::hal::format::Format::Rgba8Unorm,
+                    load: ImageLoad::DontCare,
+                });
+                let color = builder.add(TestOutput);
+                builder.add(TestPass2::new(Some(color2), None, None));
+                builder.add(TestPass2::new(Some(color), Some(color2), None));
+                builder.add(TestPass::new(color, Some(depth)));
+                let buf1 = builder.add(TestCompute1::new(Some(color)));
+                builder.add(TestPass::new(color2, Some(depth2)));
+                builder.add(TestPass3::new(color, buf1, false));
+                builder.add(TestPass3::new(color, buf1, true));
+                builder.add(TestPass2::new(Some(color2), Some(color), None));
+                builder.add(TestPass2::new(Some(color), Some(color2), None));
+                builder.add(TestPass2::new(Some(color), Some(color2), Some(depth2)));
+                builder.add(TestPass::new(color, Some(depth)));
+                builder.add(TestPass::new(color, None));
 
-        builder.add(TestPass2::new(Some(color2), None, None));
-        builder.add(TestPass2::new(Some(color), Some(color2), None));
-        builder.add(TestPass::new(color, None));
+                builder.add(TestPass2::new(Some(color2), None, None));
+                builder.add(TestPass2::new(Some(color), Some(color2), None));
+                builder.add(TestPass::new(color, None));
 
-        let mut graph = builder.build(&mut factory, &mut families, &()).unwrap();
-        unsafe {
-            graph.alloc.reset();
-        }
-        let mut run_ctx = RunContext::new(&factory, &families, &graph.alloc);
-        graph
-            .nodes
-            .run_construction_phase(&mut run_ctx, &())
-            .unwrap();
+                let mut graph = builder.build(&mut factory, &mut families, &()).unwrap();
+                unsafe {
+                    graph.alloc.reset();
+                }
+                let mut run_ctx = RunContext::new(&factory, &families, &graph.alloc);
+                graph
+                    .nodes
+                    .run_construction_phase(&mut run_ctx, &())
+                    .unwrap();
 
-        let mut file = std::fs::File::create("graph.dot").unwrap();
-        visualize_graph(&mut file, &run_ctx.graph.dag, "raw");
+                let mut file = std::fs::File::create("graph.dot").unwrap();
+                visualize_graph(&mut file, &run_ctx.graph.dag, "raw");
 
-        graph.pipeline.reduce(&mut run_ctx.graph.dag, &graph.alloc);
-        visualize_graph(&mut file, &run_ctx.graph.dag, "opti");
-        run_ctx.run_execution_phase(&()).unwrap();
+                graph.pipeline.reduce(&mut run_ctx.graph.dag, &graph.alloc);
+                visualize_graph(&mut file, &run_ctx.graph.dag, "opti");
+                run_ctx.run_execution_phase(&()).unwrap();
+
+            }
+        );
     }
 }

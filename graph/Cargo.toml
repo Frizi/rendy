@@ -47,3 +47,4 @@ purple = { git = "https://github.com/jaynus/purple.git", branch = "master" }
 [dev-dependencies]
 env_logger = "0.6"
 dot = "0.1"
+rendy-init = { path = "../init", features = ["winit"] }

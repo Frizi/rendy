@@ -5,8 +5,8 @@ use {
         pipeline::{node_ext::NodeExt, Contributions},
         resources::{AttachmentAccess, NodeBufferAccess, NodeImageAccess},
     },
-    gfx_hal::Backend,
     graphy::{Direction, EdgeIndex, NodeIndex, Walker},
+    rendy_core::hal::Backend,
     smallvec::{smallvec, SmallVec},
 };
 
@@ -134,7 +134,7 @@ struct UsesSnapshot {
             NodeIndex,
             EdgeIndex,
             NodeBufferAccess,
-            gfx_hal::pso::PipelineStage,
+            rendy_core::hal::pso::PipelineStage,
         ); 4],
     >,
     img_accesses: SmallVec<
@@ -142,7 +142,7 @@ struct UsesSnapshot {
             NodeIndex,
             EdgeIndex,
             NodeImageAccess,
-            gfx_hal::pso::PipelineStage,
+            rendy_core::hal::pso::PipelineStage,
         ); 4],
     >,
 }
@@ -366,18 +366,18 @@ mod test {
     fn color_node<'a>(id: usize) -> PlanNode<'a, TestBackend, ()> {
         PlanNode::Image(ImageNode {
             id: ImageId(NodeId(0), id),
-            kind: gfx_hal::image::Kind::D2(1024, 1024, 1, 1),
+            kind: rendy_core::hal::image::Kind::D2(1024, 1024, 1, 1),
             levels: 1,
-            format: gfx_hal::format::Format::Rgba8Unorm,
+            format: rendy_core::hal::format::Format::Rgba8Unorm,
         })
     }
 
     fn depth_node<'a>(id: usize) -> PlanNode<'a, TestBackend, ()> {
         PlanNode::Image(ImageNode {
             id: ImageId(NodeId(0), id),
-            kind: gfx_hal::image::Kind::D2(1024, 1024, 1, 1),
+            kind: rendy_core::hal::image::Kind::D2(1024, 1024, 1, 1),
             levels: 1,
-            format: gfx_hal::format::Format::R32Sfloat,
+            format: rendy_core::hal::format::Format::R32Sfloat,
         })
     }
 

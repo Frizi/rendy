@@ -16,7 +16,7 @@ use {
             track::Track,
         },
     },
-    gfx_hal::Backend,
+    rendy_core::hal::Backend,
 };
 
 /// Rendering node that copies one image onto another.
@@ -124,45 +124,49 @@ unsafe fn encode_copy<B, C, L>(
     L: Level,
 {
     let (mut stages, mut barriers) = gfx_acquire_barriers(None, Some(src_image));
-    stages.start |= gfx_hal::pso::PipelineStage::TRANSFER;
-    stages.end |= gfx_hal::pso::PipelineStage::TRANSFER;
-    barriers.push(gfx_hal::memory::Barrier::Image {
+    stages.start |= rendy_core::hal::pso::PipelineStage::TRANSFER;
+    stages.end |= rendy_core::hal::pso::PipelineStage::TRANSFER;
+    barriers.push(rendy_core::hal::memory::Barrier::Image {
         states: (
-            gfx_hal::image::Access::empty(),
-            gfx_hal::image::Layout::Undefined,
+            rendy_core::hal::image::Access::empty(),
+            rendy_core::hal::image::Layout::Undefined,
         )
             ..(
-                gfx_hal::image::Access::TRANSFER_WRITE,
-                gfx_hal::image::Layout::TransferDstOptimal,
+                rendy_core::hal::image::Access::TRANSFER_WRITE,
+                rendy_core::hal::image::Layout::TransferDstOptimal,
             ),
         families: None,
         target: dst_image.image.raw(),
-        range: gfx_hal::image::SubresourceRange {
-            aspects: gfx_hal::format::Aspects::COLOR,
+        range: rendy_core::hal::image::SubresourceRange {
+            aspects: rendy_core::hal::format::Aspects::COLOR,
             levels: 0..1,
             layers: 0..1,
         },
     });
-    encoder.pipeline_barrier(stages, gfx_hal::memory::Dependencies::empty(), barriers);
+    encoder.pipeline_barrier(
+        stages,
+        rendy_core::hal::memory::Dependencies::empty(),
+        barriers,
+    );
     encoder.copy_image(
         src_image.image.raw(),
         src_image.layout,
         dst_image.image.raw(),
-        gfx_hal::image::Layout::TransferDstOptimal,
-        Some(gfx_hal::command::ImageCopy {
-            src_subresource: gfx_hal::image::SubresourceLayers {
+        rendy_core::hal::image::Layout::TransferDstOptimal,
+        Some(rendy_core::hal::command::ImageCopy {
+            src_subresource: rendy_core::hal::image::SubresourceLayers {
                 aspects: src_image.range.aspects,
                 level: 0,
                 layers: src_image.range.layers.start..src_image.range.layers.start + 1,
             },
-            src_offset: gfx_hal::image::Offset::ZERO,
-            dst_subresource: gfx_hal::image::SubresourceLayers {
-                aspects: gfx_hal::format::Aspects::COLOR,
+            src_offset: rendy_core::hal::image::Offset::ZERO,
+            dst_subresource: rendy_core::hal::image::SubresourceLayers {
+                aspects: rendy_core::hal::format::Aspects::COLOR,
                 level: 0,
                 layers: 0..1,
             },
-            dst_offset: gfx_hal::image::Offset::ZERO,
-            extent: gfx_hal::image::Extent {
+            dst_offset: rendy_core::hal::image::Offset::ZERO,
+            extent: rendy_core::hal::image::Extent {
                 width: dst_image.image.kind().extent().width,
                 height: dst_image.image.kind().extent().height,
                 depth: 1,
@@ -170,24 +174,28 @@ unsafe fn encode_copy<B, C, L>(
         }),
     );
     let (mut stages, mut barriers) = gfx_release_barriers(None, Some(src_image));
-    stages.start |= gfx_hal::pso::PipelineStage::TRANSFER;
-    stages.end |= gfx_hal::pso::PipelineStage::BOTTOM_OF_PIPE;
-    barriers.push(gfx_hal::memory::Barrier::Image {
+    stages.start |= rendy_core::hal::pso::PipelineStage::TRANSFER;
+    stages.end |= rendy_core::hal::pso::PipelineStage::BOTTOM_OF_PIPE;
+    barriers.push(rendy_core::hal::memory::Barrier::Image {
         states: (
-            gfx_hal::image::Access::TRANSFER_WRITE,
-            gfx_hal::image::Layout::TransferDstOptimal,
+            rendy_core::hal::image::Access::TRANSFER_WRITE,
+            rendy_core::hal::image::Layout::TransferDstOptimal,
         )
             ..(
-                gfx_hal::image::Access::empty(),
-                gfx_hal::image::Layout::Present,
+                rendy_core::hal::image::Access::empty(),
+                rendy_core::hal::image::Layout::Present,
             ),
         families: None,
         target: dst_image.image.raw(),
-        range: gfx_hal::image::SubresourceRange {
-            aspects: gfx_hal::format::Aspects::COLOR,
+        range: rendy_core::hal::image::SubresourceRange {
+            aspects: rendy_core::hal::format::Aspects::COLOR,
             levels: 0..1,
             layers: 0..1,
         },
     });
-    encoder.pipeline_barrier(stages, gfx_hal::memory::Dependencies::empty(), barriers);
+    encoder.pipeline_barrier(
+        stages,
+        rendy_core::hal::memory::Dependencies::empty(),
+        barriers,
+    );
 }

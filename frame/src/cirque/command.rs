@@ -5,6 +5,7 @@ use {
         InitialState, Level, MultiShot, NoSimultaneousUse, OutsideRenderPass, PendingState,
         PrimaryLevel, RecordingState, RenderPassRelation, SimultaneousUse, Submit,
     },
+    rendy_core::hal::Backend,
 };
 
 ///
@@ -40,7 +41,7 @@ pub type CommandReadyRef<'a, B, C, P = OutsideRenderPass, L = PrimaryLevel> = Re
 
 impl<B, C, P, L> CommandCirque<B, C, P, L>
 where
-    B: rendy_core::hal::Backend,
+    B: Backend,
     L: Level,
     C: Capability,
     P: RenderPassRelation<L>,
@@ -109,22 +110,24 @@ type CommandFinishOverlapRef<B, C, P = OutsideRenderPass, L = PrimaryLevel> = De
 /// Specialized cirque for multishot simulateneous use command buffers.
 /// Allows for reusing the encoded command buffer for multiple frames
 /// and reencoding as needed.
-#[derive(Debug, derivative::Derivative)]
-#[derivative(Default(bound = ""))]
-pub struct CommandCirqueOverlap<B, C, P = OutsideRenderPass, L = PrimaryLevel>
-where
-    B: gfx_hal::Backend,
-    L: Level,
-    C: Capability,
-    P: RenderPassRelation<L>,
-{
+#[derive(Debug)]
+pub struct CommandCirqueOverlap<B: Backend, C, P = OutsideRenderPass, L = PrimaryLevel> {
     cirque: CommandCirqueOverlapInner<B, C, P, L>,
     detached: Option<CommandFinishOverlapRef<B, C, P, L>>,
 }
 
+impl<B: Backend, C, P, L> Default for CommandCirqueOverlap<B, C, P, L> {
+    fn default() -> Self {
+        Self {
+            cirque: Default::default(),
+            detached: None,
+        }
+    }
+}
+
 impl<B, C, P, L> CommandCirqueOverlap<B, C, P, L>
 where
-    B: gfx_hal::Backend,
+    B: Backend,
     L: Level,
     C: Capability,
     P: RenderPassRelation<L>,

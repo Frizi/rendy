@@ -135,7 +135,7 @@ pub struct DetachedReadyRef<T, I = T, P = T> {
 impl<T, I, P> DetachedReadyRef<T, I, P> {
     /// Reattach value to cirque.
     /// Safety: Value must be returned to cirque it was taken from.
-    pub unsafe fn attach<'a, B: gfx_hal::Backend>(
+    pub unsafe fn attach<'a, B: rendy_core::hal::Backend>(
         self,
         cirque: &'a mut Cirque<T, I, P>,
         frames: &Frames<B>,
@@ -173,7 +173,7 @@ pub struct DetachedFinishRef<T, I = T, P = T> {
 impl<T, I, P> DetachedFinishRef<T, I, P> {
     /// Reattach value to cirque.
     /// Safety: Value must be returned to cirque it was taken from.
-    pub unsafe fn attach<B: gfx_hal::Backend>(
+    pub unsafe fn attach<B: rendy_core::hal::Backend>(
         self,
         cirque: &mut Cirque<T, I, P>,
         frames: &Frames<B>,

@@ -3,8 +3,8 @@ use crate::new::{
     graph_reducer::GraphEditor,
     pipeline::Contributions,
 };
-use gfx_hal::Backend;
 use graphy::{NodeIndex, Walker};
+use rendy_core::hal::Backend;
 
 pub(crate) trait NodeExt<B: Backend, T: ?Sized> {
     fn origin(&self, graph: &PlanDag<B, T>) -> Option<NodeIndex>;

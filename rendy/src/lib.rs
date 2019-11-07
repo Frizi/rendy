@@ -71,24 +71,8 @@ pub use rendy_texture as texture;
 #[doc(inline)]
 pub use rendy_wsi as wsi;
 
-/// Init rendy and execute code based on chosen backend
 #[cfg(feature = "init")]
-#[macro_export]
-macro_rules! with_any_rendy {
-    (($rendy:expr) $(use $back:ident;)?($factory:pat, $families:pat) => $code:block) => {{
-        $crate::core::rendy_backend!(match ($rendy): $crate::init::AnyRendy {
-            $(use $back;)?_($crate::init::Rendy { factory: $factory, families: $families }) => { $code }
-        })
-    }}
-}
+pub use init::with_any_rendy;
 
-/// Init rendy and execute code based on chosen backend
 #[cfg(feature = "init")]
-#[macro_export]
-macro_rules! with_any_windowed_rendy {
-    (($rendy:expr) $(use $back:ident;)? ($factory:pat, $families:pat, $surface:pat, $window:pat) => $code:block) => {{
-        $crate::core::rendy_backend!(match ($rendy): $crate::init::AnyWindowedRendy {
-            $(use $back;)?_($crate::init::WindowedRendy { factory: $factory, families: $families, surface: $surface, window: $window }) => { $code }
-        })
-    }}
-}
+pub use init::with_any_windowed_rendy;
