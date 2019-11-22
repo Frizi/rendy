@@ -6,48 +6,48 @@ use crate::new::{
 use graphy::{NodeIndex, Walker};
 use rendy_core::hal::Backend;
 
-pub(crate) trait NodeExt<B: Backend, T: ?Sized> {
-    fn origin(&self, graph: &PlanDag<B, T>) -> Option<NodeIndex>;
-    fn version(&self, graph: &PlanDag<B, T>) -> Option<NodeIndex>;
-    fn child_version(&self, graph: &PlanDag<B, T>) -> Option<NodeIndex>;
+pub(crate) trait NodeExt<B: Backend> {
+    fn origin(&self, graph: &PlanDag<B>) -> Option<NodeIndex>;
+    fn version(&self, graph: &PlanDag<B>) -> Option<NodeIndex>;
+    fn child_version(&self, graph: &PlanDag<B>) -> Option<NodeIndex>;
     fn directly_uses(
         &self,
-        graph: &PlanDag<B, T>,
+        graph: &PlanDag<B>,
         contributions: &Contributions,
         other: NodeIndex,
     ) -> bool;
     fn directly_uses_or_not_at_all(
         &self,
-        graph: &PlanDag<B, T>,
+        graph: &PlanDag<B>,
         contributions: &Contributions,
         other: NodeIndex,
     ) -> bool;
-    fn has_single_user(&self, editor: &GraphEditor<B, T>) -> bool;
-    fn count_contributrions(&self, editor: &GraphEditor<B, T>, from: NodeIndex) -> usize;
+    fn has_single_user(&self, editor: &GraphEditor<B>) -> bool;
+    fn count_contributrions(&self, editor: &GraphEditor<B>, from: NodeIndex) -> usize;
 }
 
-impl<B: Backend, T: ?Sized> NodeExt<B, T> for NodeIndex {
-    fn origin(&self, graph: &PlanDag<B, T>) -> Option<NodeIndex> {
+impl<B: Backend> NodeExt<B> for NodeIndex {
+    fn origin(&self, graph: &PlanDag<B>) -> Option<NodeIndex> {
         self.parents()
-            .filter(|g: &PlanDag<B, T>, (e, _)| g[*e].is_origin())
+            .filter(|g: &PlanDag<B>, (e, _)| g[*e].is_origin())
             .walk_next(graph)
             .map(|t| t.1)
     }
-    fn version(&self, graph: &PlanDag<B, T>) -> Option<NodeIndex> {
+    fn version(&self, graph: &PlanDag<B>) -> Option<NodeIndex> {
         self.parents()
-            .filter(|g: &PlanDag<B, T>, (e, _)| g[*e].is_version())
+            .filter(|g: &PlanDag<B>, (e, _)| g[*e].is_version())
             .walk_next(graph)
             .map(|t| t.1)
     }
-    fn child_version(&self, graph: &PlanDag<B, T>) -> Option<NodeIndex> {
+    fn child_version(&self, graph: &PlanDag<B>) -> Option<NodeIndex> {
         self.children()
-            .filter(|g: &PlanDag<B, T>, (e, _)| g[*e].is_version())
+            .filter(|g: &PlanDag<B>, (e, _)| g[*e].is_version())
             .walk_next(graph)
             .map(|t| t.1)
     }
     fn directly_uses(
         &self,
-        graph: &PlanDag<B, T>,
+        graph: &PlanDag<B>,
         contributions: &Contributions,
         other: NodeIndex,
     ) -> bool {
@@ -62,7 +62,7 @@ impl<B: Backend, T: ?Sized> NodeExt<B, T> for NodeIndex {
     }
     fn directly_uses_or_not_at_all(
         &self,
-        graph: &PlanDag<B, T>,
+        graph: &PlanDag<B>,
         contributions: &Contributions,
         other: NodeIndex,
     ) -> bool {
@@ -75,7 +75,7 @@ impl<B: Backend, T: ?Sized> NodeExt<B, T> for NodeIndex {
             true
         }
     }
-    fn has_single_user(&self, editor: &GraphEditor<B, T>) -> bool {
+    fn has_single_user(&self, editor: &GraphEditor<B>) -> bool {
         self.children()
             .filter(|g, (e, n)| !editor.is_dead(*n) && g[*e] != PlanEdge::Version)
             .iter(editor.graph())
@@ -83,7 +83,7 @@ impl<B: Backend, T: ?Sized> NodeExt<B, T> for NodeIndex {
             .count()
             == 1
     }
-    fn count_contributrions(&self, editor: &GraphEditor<B, T>, from: NodeIndex) -> usize {
+    fn count_contributrions(&self, editor: &GraphEditor<B>, from: NodeIndex) -> usize {
         self.parents()
             .iter(editor.graph())
             .filter(|(_, n)| editor.context().contributions.uses(*n, from))

@@ -13,8 +13,8 @@ struct ImageBarrier<B: Backend> {
     /// The access flags controlling the image.
     pub states: Range<image::State>,
     /// The image the barrier controls.
-    pub target: Handle<Image<B>>,
     /// A `SubresourceRange` that defines which section of an image the barrier applies to.
+    pub target: Handle<Image<B>>,
     pub range: image::SubresourceRange,
     // TODO: support queue transfers
     // pub families: Option<Range<rendy_core::hal::queue::QueueFamilyId>>,

@@ -211,14 +211,8 @@ impl<S, W> SyncData<S, W> {
     {
         SyncData {
             wait: self.wait,
-            acquire: Guard {
-                buffers: self.acquire.buffers,
-                images: self.acquire.images,
-            },
-            release: Guard {
-                buffers: self.release.buffers,
-                images: self.release.images,
-            },
+            acquire: self.acquire,
+            release: self.release,
             signal: self
                 .signal
                 .into_iter()
@@ -237,14 +231,8 @@ impl<S, W> SyncData<S, W> {
                 .into_iter()
                 .map(|Wait(semaphore, stage)| Wait(f(semaphore), stage))
                 .collect(),
-            acquire: Guard {
-                buffers: self.acquire.buffers,
-                images: self.acquire.images,
-            },
-            release: Guard {
-                buffers: self.release.buffers,
-                images: self.release.images,
-            },
+            acquire: self.acquire,
+            release: self.release,
             signal: self.signal,
         }
     }

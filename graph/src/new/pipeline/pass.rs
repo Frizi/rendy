@@ -18,8 +18,8 @@ use {
 #[derive(Debug)]
 pub(super) struct CombinePassesReducer;
 
-impl<'a, B: Backend, T: ?Sized> Reducer<B, T> for CombinePassesReducer {
-    fn reduce(&mut self, editor: &mut GraphEditor<B, T>, node: NodeIndex) -> Reduction {
+impl<'a, B: Backend> Reducer<B> for CombinePassesReducer {
+    fn reduce(&mut self, editor: &mut GraphEditor<B>, node: NodeIndex) -> Reduction {
         // combining passes is done from top to bottom.
         // Subpass can only be translated into pass when it doesn't dpeend on other subpasses.
         //
@@ -34,7 +34,7 @@ impl<'a, B: Backend, T: ?Sized> Reducer<B, T> for CombinePassesReducer {
         // @Improvement: merge buffers/images, take them into account when constructing subpass dependencies
         let mut attachments = node
             .parents()
-            .filter(|graph: &PlanDag<B, T>, &(edge, _)| graph[edge].is_attachment_ref());
+            .filter(|graph: &PlanDag<B>, &(edge, _)| graph[edge].is_attachment_ref());
 
         let num_subpasses = attachments
             .clone()
@@ -53,7 +53,7 @@ impl<'a, B: Backend, T: ?Sized> Reducer<B, T> for CombinePassesReducer {
             return Reduction::NoChange;
         }
 
-        let mut potential_merges: SmallVec<[PotentialMerge; 32]> = SmallVec::new();
+        let mut potential_merges: SmallVec<[PotentialMerge; 16]> = SmallVec::new();
 
         for (edge, input) in attachments.clone().iter(editor.graph()) {
             let origin = input
@@ -151,7 +151,7 @@ impl<'a, B: Backend, T: ?Sized> Reducer<B, T> for CombinePassesReducer {
             // gather all existing attachments in the pass
             let pass_attachments = pass_node
                 .parents()
-                .filter(|graph: &PlanDag<B, T>, &(edge, _)| graph[edge].is_pass_attachment());
+                .filter(|graph: &PlanDag<B>, &(edge, _)| graph[edge].is_pass_attachment());
 
             let mut num_attachments = pass_attachments.clone().iter(editor.graph()).count();
             let subpass_index = editor.graph_mut()[pass_node]
@@ -244,9 +244,7 @@ impl<'a, B: Backend, T: ?Sized> Reducer<B, T> for CombinePassesReducer {
     }
 }
 
-fn attachment_ops<B: Backend, T: ?Sized>(
-    writer_node: &mut PlanNode<B, T>,
-) -> (AttachmentOps, AttachmentClear) {
+fn attachment_ops<B: Backend>(writer_node: &mut PlanNode<B>) -> (AttachmentOps, AttachmentClear) {
     let (clear, load) = match writer_node {
         PlanNode::ImageVersion => (AttachmentClear(None), AttachmentLoadOp::Load),
         PlanNode::LoadImage(..) => (AttachmentClear(None), AttachmentLoadOp::Load),
@@ -268,9 +266,9 @@ fn attachment_ops<B: Backend, T: ?Sized>(
     (ops, clear)
 }
 
-fn process_new_attachment<B: Backend, T: ?Sized>(
+fn process_new_attachment<B: Backend>(
     ref_edge: &AttachmentRefEdge,
-    subpass: &mut RenderPassSubpass<B, T>,
+    subpass: &mut RenderPassSubpass<B>,
     subpass_index: usize,
     deps: &mut SmallVec<[rendy_core::hal::pass::SubpassDependency; 32]>,
     ops: AttachmentOps,
@@ -338,9 +336,9 @@ fn process_new_attachment<B: Backend, T: ?Sized>(
     attachment
 }
 
-fn process_existing_attachment<B: Backend, T: ?Sized>(
+fn process_existing_attachment<B: Backend>(
     ref_edge: &AttachmentRefEdge,
-    subpass: &mut RenderPassSubpass<B, T>,
+    subpass: &mut RenderPassSubpass<B>,
     subpass_index: usize,
     deps: &mut SmallVec<[rendy_core::hal::pass::SubpassDependency; 32]>,
     attachment: &mut RenderPassAtachment,

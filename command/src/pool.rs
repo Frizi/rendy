@@ -73,7 +73,7 @@ where
     ) -> Vec<CommandBuffer<B, C, InitialState, L, R>>
     where
         L: Level,
-        C: Capability,
+        C: Clone,
     {
         let level = L::default();
 
@@ -84,7 +84,7 @@ where
             .map(|raw| unsafe {
                 CommandBuffer::from_raw(
                     raw,
-                    self.capability,
+                    self.capability.clone(),
                     InitialState,
                     level,
                     self.reset,
@@ -95,8 +95,12 @@ where
     }
 
     /// Free buffers.
-    /// Buffers must be in droppable state.
-    /// TODO: Validate buffers were allocated from this pool.
+    ///
+    /// # Safety
+    /// * Buffers must be in droppable state.
+    /// * Buffers must come from this pool.
+    ///
+    /// TODO: Internally validate that buffers were allocated from this pool.
     pub unsafe fn free_buffers(
         &mut self,
         buffers: impl IntoIterator<Item = CommandBuffer<B, C, impl Resettable, impl Level, R>>,

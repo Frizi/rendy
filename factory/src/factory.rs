@@ -321,7 +321,16 @@ where
         memory_usage: impl MemoryUsage,
     ) -> Result<Escape<Image<B>>, ImageCreationError> {
         let image = self.create_relevant_image(info, memory_usage)?;
-        Ok(self.resources.images.escape(image))
+        Ok(self.escape_image(image))
+    }
+
+    /// Escapes an existing image instance.
+    ///
+    /// Useful when you want to safely share an image previously created with `create_relevant_image`.
+    ///
+    /// [`create_relevant_image`]: #method.create_relevant_image
+    pub fn escape_image(&self, image: Image<B>) -> Escape<Image<B>> {
+        self.resources.images.escape(image)
     }
 
     /// Fetch image format details for a particular `ImageInfo`.
@@ -805,7 +814,7 @@ where
         unsafe {
             surface.into_target(
                 &self.adapter.physical_device,
-                &self.device,
+                &self,
                 extent,
                 image_count,
                 present_mode,

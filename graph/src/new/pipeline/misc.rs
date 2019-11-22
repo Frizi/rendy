@@ -11,8 +11,8 @@ use {
 #[derive(Debug)]
 pub(super) struct CombineVersionsReducer;
 
-impl<'a, B: Backend, T: ?Sized> Reducer<B, T> for CombineVersionsReducer {
-    fn reduce(&mut self, editor: &mut GraphEditor<B, T>, node: NodeIndex) -> Reduction {
+impl<'a, B: Backend> Reducer<B> for CombineVersionsReducer {
+    fn reduce(&mut self, editor: &mut GraphEditor<B>, node: NodeIndex) -> Reduction {
         if let PlanNode::ImageVersion = editor.graph()[node] {
             // combine two version nodes if those are consecutive and have the same origin
             if let Some(version) = node.version(editor.graph()) {
@@ -27,8 +27,8 @@ impl<'a, B: Backend, T: ?Sized> Reducer<B, T> for CombineVersionsReducer {
 
 #[derive(Debug)]
 pub(super) struct InsertStoresReducer;
-impl<'a, B: Backend, T: ?Sized> Reducer<B, T> for InsertStoresReducer {
-    fn reduce(&mut self, editor: &mut GraphEditor<B, T>, node: NodeIndex) -> Reduction {
+impl<'a, B: Backend> Reducer<B> for InsertStoresReducer {
+    fn reduce(&mut self, editor: &mut GraphEditor<B>, node: NodeIndex) -> Reduction {
         if let PlanNode::LoadImage(..) = editor.graph()[node] {
             let mut head = node;
             while let Some(version) = head.child_version(editor.graph()) {
@@ -44,8 +44,8 @@ impl<'a, B: Backend, T: ?Sized> Reducer<B, T> for InsertStoresReducer {
 
 #[derive(Debug)]
 pub(super) struct OrderWritesReducer;
-impl<B: Backend, T: ?Sized> Reducer<B, T> for OrderWritesReducer {
-    fn reduce(&mut self, editor: &mut GraphEditor<B, T>, node: NodeIndex) -> Reduction {
+impl<B: Backend> Reducer<B> for OrderWritesReducer {
+    fn reduce(&mut self, editor: &mut GraphEditor<B>, node: NodeIndex) -> Reduction {
         let mut write_accesses = node
             .children()
             .filter(|graph, &(edge, _)| match &graph[edge] {

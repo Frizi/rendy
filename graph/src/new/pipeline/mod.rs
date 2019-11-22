@@ -18,13 +18,13 @@ use misc::{CombineVersionsReducer, OrderWritesReducer};
 use pass::CombinePassesReducer;
 use subpass::CombineSubpassesReducer;
 
-pub(crate) struct Pipeline<B: Backend, T: ?Sized> {
-    stage1: GraphReducer<B, T>,
-    stage2: GraphReducer<B, T>,
-    stage3: GraphReducer<B, T>,
+pub(crate) struct Pipeline<B: Backend> {
+    stage1: GraphReducer<B>,
+    stage2: GraphReducer<B>,
+    stage3: GraphReducer<B>,
 }
 
-impl<B: Backend, T: ?Sized> std::fmt::Debug for Pipeline<B, T> {
+impl<B: Backend> std::fmt::Debug for Pipeline<B> {
     fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
         fmt.debug_struct("Pipeline")
             .field("stage1", &self.stage1)
@@ -34,7 +34,7 @@ impl<B: Backend, T: ?Sized> std::fmt::Debug for Pipeline<B, T> {
     }
 }
 
-impl<B: Backend, T: ?Sized> Pipeline<B, T> {
+impl<B: Backend> Pipeline<B> {
     pub(crate) fn new() -> Self {
         Self {
             stage1: GraphReducer::new()
@@ -47,11 +47,7 @@ impl<B: Backend, T: ?Sized> Pipeline<B, T> {
         }
     }
     #[inline(never)]
-    pub(crate) fn reduce<'a>(
-        &mut self,
-        graph: &mut PlanDag<'_, 'a, B, T>,
-        alloc: &'a GraphAllocator,
-    ) {
+    pub(crate) fn reduce<'a>(&mut self, graph: &mut PlanDag<'_, 'a, B>, alloc: &'a GraphAllocator) {
         let start = std::time::Instant::now();
         // let mut file = std::fs::File::create("graph.dot").unwrap();
 
@@ -96,10 +92,7 @@ pub(crate) struct Contributions<'a> {
 }
 
 impl<'a> Contributions<'a> {
-    fn collect<B: Backend, T: ?Sized>(
-        graph: &PlanDag<'_, 'a, B, T>,
-        alloc: &'a GraphAllocator,
-    ) -> Self {
+    fn collect<B: Backend>(graph: &PlanDag<'_, 'a, B>, alloc: &'a GraphAllocator) -> Self {
         let align = 128;
         let row_size = (graph.node_count() + align - 1) & !(align - 1);
         let total_size = row_size * graph.node_count();

@@ -1,12 +1,11 @@
 use {
     super::{
-        graph::{BufferToken, ImageToken, NodeContext, NodeCtx},
+        graph::{ExecContext, ExecPassContext, NodeContext, NodeCtx},
         resources::{BufferId, ImageId, ResourceUsage},
     },
     crate::{
-        command::{Capability, Families, Family, FamilyId, Fence, Queue, Submission, Submittable},
+        command::{Capability, Families, Family, FamilyId},
         factory::{Factory, UploadError},
-        frame::Frames,
         resource::{Buffer, Handle, Image},
         wsi::SwapchainError,
     },
@@ -21,7 +20,7 @@ pub struct NodeId(pub(super) usize);
 pub type ConstructResult<'run, N, B, T> = Result<
     (
         <<N as Node<B, T>>::Outputs as OutputList>::Data,
-        NodeExecution<'run, B, T>,
+        NodeExecution<'run, B>,
     ),
     NodeConstructionError,
 >;
@@ -34,12 +33,13 @@ pub trait Node<B: Backend, T: ?Sized>: std::fmt::Debug + Send + Sync {
     /// Returns a rendering job that is going to be scheduled for execution if anything reads resources the node have declared to write.
     fn construct<'run>(
         &'run mut self,
-        ctx: &mut impl NodeCtx<'run, B, T>,
+        ctx: &mut impl NodeCtx<'run, B>,
+        aux: &'run T,
     ) -> ConstructResult<'run, Self, B, T>;
 
     /// Dispose of the node.
     /// Called after device idle
-    fn dispose(self: Box<Self>, factory: &mut Factory<B>, aux: &T) {
+    unsafe fn dispose(self: Box<Self>, factory: &mut Factory<B>, aux: &T) {
         let _ = (factory, aux);
     }
 }
@@ -75,8 +75,9 @@ impl OutputStore {
 pub(crate) trait DynNode<B: Backend, T: ?Sized>: std::fmt::Debug + Send + Sync {
     fn construct<'run>(
         &'run mut self,
-        ctx: &mut NodeContext<'_, 'run, '_, B, T>,
-    ) -> Result<NodeExecution<B, T>, NodeConstructionError>;
+        ctx: &mut NodeContext<'_, 'run, '_, B>,
+        aux: &'run T,
+    ) -> Result<NodeExecution<B>, NodeConstructionError>;
 
     /// # Safety
     ///
@@ -87,9 +88,10 @@ pub(crate) trait DynNode<B: Backend, T: ?Sized>: std::fmt::Debug + Send + Sync {
 impl<B: Backend, T: ?Sized, N: Node<B, T>> DynNode<B, T> for N {
     fn construct<'run>(
         &'run mut self,
-        ctx: &mut NodeContext<'_, 'run, '_, B, T>,
-    ) -> Result<NodeExecution<B, T>, NodeConstructionError> {
-        let (outs, exec) = N::construct(self, ctx)?;
+        ctx: &mut NodeContext<'_, 'run, '_, B>,
+        aux: &'run T,
+    ) -> Result<NodeExecution<B>, NodeConstructionError> {
+        let (outs, exec) = N::construct(self, ctx, aux)?;
         ctx.set_outputs(N::Outputs::iter(outs));
         Ok(exec)
     }
@@ -347,161 +349,91 @@ impl<B: Backend, T: ?Sized, N: NodeBuilder<B, T>> DynNodeBuilder<B, T> for N {
 }
 
 pub type ExecResult = Result<(), NodeExecutionError>;
-pub type PassFn<'n, B, T> =
-    Box<dyn for<'a> FnOnce(ExecPassContext<'a, B>, &'a T) -> ExecResult + 'n>;
-pub type GeneralFn<'n, B, T> =
-    Box<dyn for<'a> FnOnce(ExecContext<'a, B>, &'a T) -> ExecResult + 'n>;
+pub type PassFn<'n, B> = Box<dyn for<'a> FnOnce(ExecPassContext<'a, B>) -> ExecResult + 'n>;
+pub type SubmissionFn<'run, B> =
+    Box<dyn for<'a> FnOnce(ExecContext<'a, 'run, B>) -> ExecResult + 'run>;
+pub type PostSubmitFn<'run, B> =
+    Box<dyn for<'a> FnOnce(ExecContext<'a, 'run, B>) -> ExecResult + 'run>;
 
-pub enum NodeExecution<'n, B: Backend, T: ?Sized> {
+#[derive(Debug, Clone, Copy)]
+pub enum ExecutionPhase {
+    Default,
+    Output,
+}
+
+pub enum NodeExecution<'n, B: Backend> {
     /// This node has no evaluation phase.
     /// The resource access rules still apply as if the evaluation phase had to take place.
     None,
     /// Node evaluated in a context of rendering pass.
     /// The attachment layout is determined from declared image accesses (based on read/write flags), in order of their declaration.
     /// Can only operate on secondary command buffers.
-    RenderPass(PassFn<'n, B, T>),
-    /// The most general rendering node, must manually submit to do any work.
-    General(GeneralFn<'n, B, T>),
-    /// Like general, but always scheduled after other non-output nodes.
-    /// All resources read by output nodes are considered root, which guarantees evaluation of whoever writes them last.
-    Output(GeneralFn<'n, B, T>),
+    RenderPass(PassFn<'n, B>),
+    /// A general rendering node, returns submittable work.
+    Submission(ExecutionPhase, SubmissionFn<'n, B>),
+    /// A general rendering node, operate after submission have happened.
+    PostSubmit(ExecutionPhase, PostSubmitFn<'n, B>),
 }
 
-impl<'n, B: Backend, T: ?Sized> std::fmt::Debug for NodeExecution<'n, B, T> {
+impl<'n, B: Backend> std::fmt::Debug for NodeExecution<'n, B> {
     fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self {
             NodeExecution::None => fmt.debug_tuple("None").finish(),
             NodeExecution::RenderPass(_) => fmt.debug_tuple("RenderPass").finish(),
-            NodeExecution::Output(_) => fmt.debug_tuple("General").finish(),
-            NodeExecution::General(_) => fmt.debug_tuple("General").finish(),
+            NodeExecution::Submission(phase, _) => {
+                fmt.debug_tuple("Submission").field(&phase).finish()
+            }
+            NodeExecution::PostSubmit(phase, _) => {
+                fmt.debug_tuple("PostSubmit").field(&phase).finish()
+            }
         }
     }
 }
 
-impl<'n, B: Backend, T: ?Sized> NodeExecution<'n, B, T> {
+impl<'run, B: Backend> NodeExecution<'run, B> {
     pub fn is_output(&self) -> bool {
         match self {
-            NodeExecution::Output(_) => true,
+            NodeExecution::Submission(ExecutionPhase::Output, _) => true,
+            NodeExecution::PostSubmit(ExecutionPhase::Output, _) => true,
             _ => false,
         }
     }
 
     pub fn pass<F>(pass_closure: F) -> Self
     where
-        F: for<'a> FnOnce(ExecPassContext<'a, B>, &'a T) -> ExecResult + 'n,
+        F: for<'a> FnOnce(ExecPassContext<'a, B>) -> ExecResult + 'run,
     {
         Self::RenderPass(Box::new(pass_closure))
     }
 
-    pub fn general<F>(general_closure: F) -> Self
+    pub fn submission<F>(general_closure: F) -> Self
     where
-        F: for<'a> FnOnce(ExecContext<'a, B>, &'a T) -> ExecResult + 'n,
+        F: for<'a> FnOnce(ExecContext<'a, 'run, B>) -> ExecResult + 'run,
     {
-        Self::General(Box::new(general_closure))
+        Self::Submission(ExecutionPhase::Default, Box::new(general_closure))
     }
 
-    pub fn output<F>(general_closure: F) -> Self
+    pub fn output_submission<F>(general_closure: F) -> Self
     where
-        F: for<'a> FnOnce(ExecContext<'a, B>, &'a T) -> ExecResult + 'n,
+        F: for<'a> FnOnce(ExecContext<'a, 'run, B>) -> ExecResult + 'run,
     {
-        Self::Output(Box::new(general_closure))
-    }
-}
-
-#[derive(Debug)]
-pub struct ExecContext<'a, B: Backend> {
-    factory: &'a Factory<B>,
-    images: HashMap<ImageId, NodeImage<B>>,
-    buffers: HashMap<BufferId, NodeBuffer<B>>,
-    queue: &'a mut Queue<B>,
-    frames: &'a Frames<B>,
-    waits: smallvec::SmallVec<[(&'a B::Semaphore, rendy_core::hal::pso::PipelineStage); 16]>,
-    signals: smallvec::SmallVec<[&'a B::Semaphore; 16]>,
-    fence: Option<&'a mut Fence<B>>,
-}
-
-impl<'a, B: Backend> ExecContext<'a, B> {
-    pub(crate) fn new() -> Self {
-        unimplemented!()
+        Self::Submission(ExecutionPhase::Output, Box::new(general_closure))
     }
 
-    pub fn submit<C>(&mut self, submits: C)
+    pub fn post_submit<F>(general_closure: F) -> Self
     where
-        C: IntoIterator,
-        C::Item: Submittable<B>,
+        F: for<'a> FnOnce(ExecContext<'a, 'run, B>) -> ExecResult + 'run,
     {
-        unsafe {
-            self.queue.submit(
-                Some(
-                    Submission::new()
-                        .submits(submits)
-                        .wait(self.waits.iter().cloned())
-                        .signal(self.signals.iter().cloned()),
-                ),
-                self.fence.as_mut().map(|x| &mut **x),
-            )
-        }
+        Self::PostSubmit(ExecutionPhase::Default, Box::new(general_closure))
     }
 
-    pub fn get_image(&self, token: ImageToken) -> &NodeImage<B> {
-        self.images
-            .get(&token.id())
-            .expect("Somehow got a token to unscheduled image")
-    }
-
-    pub fn get_buffer(&self, token: BufferToken) -> &NodeBuffer<B> {
-        self.buffers
-            .get(&token.id())
-            .expect("Somehow got a token to unscheduled buffer")
-    }
-
-    pub fn frames(&self) -> &Frames<B> {
-        self.frames
+    pub fn output_post_submit<F>(general_closure: F) -> Self
+    where
+        F: for<'a> FnOnce(ExecContext<'a, 'run, B>) -> ExecResult + 'run,
+    {
+        Self::PostSubmit(ExecutionPhase::Output, Box::new(general_closure))
     }
 }
-
-#[derive(Debug)]
-pub struct ExecPassContext<'a, B: Backend> {
-    _general_ctx: ExecContext<'a, B>,
-    images: HashMap<ImageId, Handle<Image<B>>>,
-    buffers: HashMap<BufferId, Handle<Buffer<B>>>,
-}
-
-impl<'a, B: Backend> ExecPassContext<'a, B> {
-    pub fn get_image(&self, token: ImageToken) -> Handle<Image<B>> {
-        self.images
-            .get(&token.id())
-            .expect("Somehow got a token to unscheduled image")
-            .clone()
-    }
-
-    pub fn get_buffer(&self, token: BufferToken) -> Handle<Buffer<B>> {
-        self.buffers
-            .get(&token.id())
-            .expect("Somehow got a token to unscheduled buffer")
-            .clone()
-    }
-}
-
-// struct PassData {
-
-// }
-
-//     ctx,
-//     factory,
-//     QueueId {
-//         family: family.id(),
-//         index: queue,
-//     },
-//     aux,
-//     framebuffer_width,
-//     framebuffer_height,
-//     rendy_core::hal::pass::Subpass {
-//         index,
-//         main_pass: &render_pass,
-//     },
-//     buffers,
-//     images,
 
 /// Image pipeline barrier.
 /// Node implementation must insert it before first command that uses the image.

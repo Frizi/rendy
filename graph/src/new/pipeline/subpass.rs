@@ -14,8 +14,8 @@ use {
 #[derive(Debug)]
 pub(super) struct CombineSubpassesReducer;
 
-impl<'a, B: Backend, T: ?Sized> Reducer<B, T> for CombineSubpassesReducer {
-    fn reduce(&mut self, editor: &mut GraphEditor<B, T>, node: NodeIndex) -> Reduction {
+impl<'a, B: Backend> Reducer<B> for CombineSubpassesReducer {
+    fn reduce(&mut self, editor: &mut GraphEditor<B>, node: NodeIndex) -> Reduction {
         if !editor.graph()[node].is_subpass() {
             return Reduction::NoChange;
         }
@@ -27,7 +27,7 @@ impl<'a, B: Backend, T: ?Sized> Reducer<B, T> for CombineSubpassesReducer {
         // but let's not deal with generating in-subpass barriers for now.
         let mut inputs = node
             .parents()
-            .filter(|graph: &PlanDag<B, T>, &(edge, _)| graph[edge].is_attachment_ref());
+            .filter(|graph: &PlanDag<B>, &(edge, _)| graph[edge].is_attachment_ref());
 
         while let Some((_, input)) = inputs.walk_next(editor.graph()) {
             let origin = input
@@ -148,7 +148,7 @@ struct UsesSnapshot {
 }
 
 impl UsesSnapshot {
-    fn build<B: Backend, T: ?Sized>(graph: &PlanDag<B, T>, node: NodeIndex) -> Self {
+    fn build<B: Backend>(graph: &PlanDag<B>, node: NodeIndex) -> Self {
         let mut snapshot = UsesSnapshot {
             node,
             depth: None,
@@ -219,7 +219,7 @@ impl UsesSnapshot {
         }
     }
 
-    fn patch<B: Backend, T: ?Sized>(self, source: &Self, graph: &mut PlanDag<B, T>) {
+    fn patch<B: Backend>(self, source: &Self, graph: &mut PlanDag<B>) {
         if let (Some((_, edge, access_a)), Some((_, _, access_b))) = (self.depth, source.depth) {
             if access_a == AttachmentAccess::ReadWrite && access_b == AttachmentAccess::ReadOnly {
                 match graph[edge] {
@@ -264,10 +264,10 @@ impl UsesSnapshot {
         }
     }
 
-    fn mergeable<B: Backend, T: ?Sized>(
+    fn mergeable<B: Backend>(
         &self,
         other: &Self,
-        graph: &PlanDag<B, T>,
+        graph: &PlanDag<B>,
         contributions: &Contributions,
     ) -> bool {
         if !match (self.depth, other.depth) {
@@ -346,16 +346,16 @@ mod test {
     };
     use smallvec::SmallVec;
 
-    fn subpass_node<'a>(num_groups: usize) -> PlanNode<'a, TestBackend, ()> {
-        let mut vec: SmallVec<[(NodeId, PassFn<'a, TestBackend, ()>); 4]> =
+    fn subpass_node<'a>(num_groups: usize) -> PlanNode<'a, TestBackend> {
+        let mut vec: SmallVec<[(NodeId, PassFn<'a, TestBackend>); 4]> =
             SmallVec::with_capacity(num_groups);
         for _ in 0..num_groups {
-            vec.push((NodeId(0), Box::new(|_, _| Ok(()))))
+            vec.push((NodeId(0), Box::new(|_| Ok(()))))
         }
         PlanNode::RenderSubpass(vec)
     }
 
-    fn group_node<'a>() -> PlanNode<'a, TestBackend, ()> {
+    fn group_node<'a>() -> PlanNode<'a, TestBackend> {
         subpass_node(1)
     }
 
@@ -363,7 +363,7 @@ mod test {
         PlanEdge::ImageAccess(usage.access(), usage.stage())
     }
 
-    fn color_node<'a>(id: usize) -> PlanNode<'a, TestBackend, ()> {
+    fn color_node<'a>(id: usize) -> PlanNode<'a, TestBackend> {
         PlanNode::Image(ImageNode {
             id: ImageId(NodeId(0), id),
             kind: rendy_core::hal::image::Kind::D2(1024, 1024, 1, 1),
@@ -372,7 +372,7 @@ mod test {
         })
     }
 
-    fn depth_node<'a>(id: usize) -> PlanNode<'a, TestBackend, ()> {
+    fn depth_node<'a>(id: usize) -> PlanNode<'a, TestBackend> {
         PlanNode::Image(ImageNode {
             id: ImageId(NodeId(0), id),
             kind: rendy_core::hal::image::Kind::D2(1024, 1024, 1, 1),
@@ -591,7 +591,7 @@ mod test {
             group2 = group_node();
             @ group3 = group_node();
             group4 = group_node();
-            @ debug_pass = PlanNode::Run(NodeId(0), Box::new(|_, _| Ok(())));
+            @ debug_pass = PlanNode::PostSubmit(NodeId(0), Box::new(|_| Ok(())));
 
             depth_def = depth_node(0);
             color_def = color_node(1);
@@ -652,7 +652,7 @@ mod test {
             [&alloc],
             @ main_pass = subpass_node(3);
             ext_pass = subpass_node(1);
-            @ debug_pass = PlanNode::Run(NodeId(0), Box::new(|_, _| Ok(())));
+            @ debug_pass = PlanNode::PostSubmit(NodeId(0), Box::new(|_| Ok(())));
 
             depth_def = depth_node(0);
             color_def = color_node(1);

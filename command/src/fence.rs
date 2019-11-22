@@ -42,7 +42,7 @@ where
         device: &Device<B>,
         signaled: bool,
     ) -> Result<Self, rendy_core::hal::device::OutOfMemory> {
-        let raw = device.raw().create_fence(false)?;
+        let raw = device.raw().create_fence(signaled)?;
         Ok(Fence {
             device: device.id(),
             raw,

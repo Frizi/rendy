@@ -15,6 +15,10 @@ pub struct ImageId(pub(super) NodeId, pub(super) usize);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct VirtualId(pub(super) usize);
 
+/// Id of wait semaphore in graph.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WaitId(pub(super) usize);
+
 #[derive(Debug, Clone, Copy)]
 pub enum ImageLoad {
     /// Image contents left undefined. The fastest option when you expect to overwrite it all anyway.
@@ -74,6 +78,7 @@ bitflags!(
         const DEPTH_STENCIL_ATTACHMENT_WRITE = 0x80;
         const TRANSFER_READ = 0x100;
         const TRANSFER_WRITE = 0x200;
+        const PRESENT = 0x400;
     }
 );
 
@@ -94,7 +99,8 @@ impl NodeImageAccess {
                 | Self::STORAGE_IMAGE_READ
                 | Self::COLOR_ATTACHMENT_READ
                 | Self::DEPTH_STENCIL_ATTACHMENT_READ
-                | Self::TRANSFER_READ)
+                | Self::TRANSFER_READ
+                | Self::PRESENT)
     }
 
     pub fn writes(&self) -> Self {
@@ -143,6 +149,9 @@ impl NodeImageAccess {
         if self.contains(Self::TRANSFER_WRITE) {
             acc = Some(common_layout(acc, Layout::TransferDstOptimal));
         }
+        if self.contains(Self::PRESENT) {
+            acc = Some(common_layout(acc, Layout::Present));
+        }
         acc.unwrap_or(Layout::General)
     }
 }
@@ -155,11 +164,13 @@ fn common_layout(
     match (acc, layout) {
         (None, layout) => layout,
         (Some(left), right) if left == right => left,
-        (Some(Layout::DepthStencilReadOnlyOptimal), Layout::DepthStencilAttachmentOptimal) => {
+        (Some(Layout::DepthStencilReadOnlyOptimal), Layout::DepthStencilAttachmentOptimal)
+        | (Some(Layout::DepthStencilAttachmentOptimal), Layout::DepthStencilReadOnlyOptimal) => {
             Layout::DepthStencilAttachmentOptimal
         }
-        (Some(Layout::DepthStencilAttachmentOptimal), Layout::DepthStencilReadOnlyOptimal) => {
-            Layout::DepthStencilAttachmentOptimal
+        (Some(Layout::Present), other) | (Some(other), Layout::Present) => {
+            log::error!("Trying to combine Present layout with {:?}", other);
+            Layout::Present
         }
         (Some(_), _) => Layout::General,
     }
@@ -203,6 +214,7 @@ pub enum ResourceId {
     Image(ImageId),
     Buffer(BufferId),
     Virtual(VirtualId),
+    Wait(WaitId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -232,6 +244,7 @@ pub enum ResourceUsage {
     ColorAttachment(ImageId, usize),
     InputAttachment(ImageId, usize),
     DepthAttachment(ImageId, AttachmentAccess),
+    WaitSemaphore(WaitId, PipelineStage),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -245,11 +258,12 @@ impl ResourceUsage {
     fn image(&self) -> Option<ImageId> {
         match self {
             Self::Image(a, _, _) => Some(*a),
-            Self::Buffer(_, _, _) => None,
-            Self::Virtual(_, _) => None,
             Self::ColorAttachment(a, _) => Some(*a),
             Self::InputAttachment(a, _) => Some(*a),
             Self::DepthAttachment(a, _) => Some(*a),
+            Self::Buffer(..) => None,
+            Self::Virtual(..) => None,
+            Self::WaitSemaphore(..) => None,
         }
     }
 
@@ -366,6 +380,8 @@ pub enum ImageUsage {
     TransferRead,
     /// Image will be used in a memory transfer as a destination
     TransferWrite,
+    /// Image will be used in wsi present.
+    Present,
     /// Custom image usage with manually provided access and pipeline stages
     Custom(NodeImageAccess, PipelineStage),
 }
@@ -383,6 +399,7 @@ impl ImageUsage {
             Self::StorageRead(shader) => shader.stage(),
             Self::StorageWrite(shader) => shader.stage(),
             Self::TransferRead | Self::TransferWrite => PipelineStage::TRANSFER,
+            Self::Present => PipelineStage::BOTTOM_OF_PIPE,
             Self::Custom(_, stage) => *stage,
         }
     }
@@ -399,6 +416,7 @@ impl ImageUsage {
             Self::StorageWrite(_) => NodeImageAccess::STORAGE_IMAGE_WRITE,
             Self::TransferRead => NodeImageAccess::TRANSFER_READ,
             Self::TransferWrite => NodeImageAccess::TRANSFER_WRITE,
+            Self::Present => NodeImageAccess::PRESENT,
             Self::Custom(access, _) => *access,
         }
     }

@@ -73,7 +73,8 @@ impl<B: Backend, T: ?Sized> Node<B, T> for CopyImage<B> {
 
     fn construct<'run>(
         &'run mut self,
-        ctx: &mut impl NodeCtx<'run, B, T>,
+        ctx: &mut impl NodeCtx<'run, B>,
+        _aux: &'run T,
     ) -> ConstructResult<'run, Self, B, T> {
         let src_id = *ctx.get_parameter(self.src)?;
         let dst_id = *ctx.get_parameter(self.dst)?;
@@ -87,7 +88,7 @@ impl<B: Backend, T: ?Sized> Node<B, T> for CopyImage<B> {
 
         Ok((
             (),
-            NodeExecution::general(move |mut ctx, _| {
+            NodeExecution::submission(move |mut ctx| {
                 let src_image = ctx.get_image(src);
                 let dst_image = ctx.get_image(dst);
 
@@ -106,11 +107,9 @@ impl<B: Backend, T: ?Sized> Node<B, T> for CopyImage<B> {
         ))
     }
 
-    fn dispose(mut self: Box<Self>, factory: &mut Factory<B>, _aux: &T) {
-        unsafe {
-            self.cirque.dispose(&mut self.pool);
-            self.pool.dispose(factory);
-        }
+    unsafe fn dispose(mut self: Box<Self>, factory: &mut Factory<B>, _aux: &T) {
+        self.cirque.dispose(&mut self.pool);
+        self.pool.dispose(factory);
     }
 }
 
@@ -183,7 +182,7 @@ unsafe fn encode_copy<B, C, L>(
         )
             ..(
                 rendy_core::hal::image::Access::empty(),
-                rendy_core::hal::image::Layout::Present,
+                rendy_core::hal::image::Layout::Present, // TODO: get dst layout
             ),
         families: None,
         target: dst_image.image.raw(),

@@ -192,6 +192,16 @@ where
         self.family_by_index(id.index)
     }
 
+    /// Get queue by an absolute queue id.
+    pub fn queue(&self, id: QueueId) -> &Queue<B> {
+        self.family(id.family).queue(id.index)
+    }
+
+    /// Get queue by an absolute queue id.
+    pub fn queue_mut(&mut self, id: QueueId) -> &mut Queue<B> {
+        self.family_mut(id.family).queue_mut(id.index)
+    }
+
     /// Get queue family by index.
     pub fn family_by_index(&self, index: usize) -> &Family<B> {
         &self.families[self.families_indices[index]]

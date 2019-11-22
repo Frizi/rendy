@@ -28,13 +28,13 @@ impl<'a> ReductionContext<'a> {
 /// It can also edit the graphs by changing and replacing nodes other than the one
 /// currently being reduced by using the provided editor directly.
 
-pub(crate) trait Reducer<B: Backend, T: ?Sized>: std::fmt::Debug {
+pub(crate) trait Reducer<B: Backend>: std::fmt::Debug {
     /// Try to reduce a node if possible.
-    fn reduce(&mut self, editor: &mut GraphEditor<B, T>, node: NodeIndex) -> Reduction;
+    fn reduce(&mut self, editor: &mut GraphEditor<B>, node: NodeIndex) -> Reduction;
     /// Invoked once when a round of reductions is finished. Can be used to
     /// do additional reductions at the end, which in turn can cause a new round
     /// of reductions.
-    fn finalize(&mut self, editor: &mut GraphEditor<B, T>) {
+    fn finalize(&mut self, editor: &mut GraphEditor<B>) {
         let _ = editor;
     }
 
@@ -55,14 +55,14 @@ impl NodeProgress {
     }
 }
 
-type Reducers<B, T> = Vec<Box<dyn Reducer<B, T> + 'static>>;
+type Reducers<B> = Vec<Box<dyn Reducer<B> + 'static>>;
 
-pub struct GraphReducer<B: Backend, T: ?Sized> {
-    reducers: Reducers<B, T>,
+pub struct GraphReducer<B: Backend> {
+    reducers: Reducers<B>,
     state: ReductionState,
 }
 
-impl<B: Backend, T: ?Sized> std::fmt::Debug for GraphReducer<B, T> {
+impl<B: Backend> std::fmt::Debug for GraphReducer<B> {
     fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
         fmt.debug_struct("GraphReducer")
             .field("reducers", &self.reducers)
@@ -141,9 +141,9 @@ impl ReductionState {
         self.state(node) == State::Dead
     }
 
-    fn replace<B: Backend, T: ?Sized>(
+    fn replace<B: Backend>(
         &mut self,
-        graph: &mut PlanDag<B, T>,
+        graph: &mut PlanDag<B>,
         node: NodeIndex,
         replacement: NodeIndex,
         max_id: NodeIndex,
@@ -183,10 +183,10 @@ impl ReductionState {
         }
     }
 
-    fn reduce<'arena, B: Backend, T: ?Sized>(
+    fn reduce<'arena, B: Backend>(
         &mut self,
-        reducers: &mut Reducers<B, T>,
-        graph: &mut PlanDag<'_, 'arena, B, T>,
+        reducers: &mut Reducers<B>,
+        graph: &mut PlanDag<'_, 'arena, B>,
         context: &ReductionContext<'arena>,
         alloc: &'arena GraphAllocator,
         node: NodeIndex,
@@ -244,10 +244,10 @@ impl ReductionState {
         return Reduction::Changed;
     }
 
-    fn reduce_node<'run, 'arena, B: Backend, T: ?Sized>(
+    fn reduce_node<'run, 'arena, B: Backend>(
         &mut self,
-        reducers: &mut Reducers<B, T>,
-        graph: &mut PlanDag<'run, 'arena, B, T>,
+        reducers: &mut Reducers<B>,
+        graph: &mut PlanDag<'run, 'arena, B>,
         context: &ReductionContext<'arena>,
         alloc: &'arena GraphAllocator,
         node: NodeIndex,
@@ -300,11 +300,7 @@ impl ReductionState {
         debug_assert!(self.node_flags.is_empty());
     }
 
-    fn recurse_top_inputs<B: Backend, T: ?Sized>(
-        &mut self,
-        graph: &mut PlanDag<B, T>,
-        reset: bool,
-    ) -> bool {
+    fn recurse_top_inputs<B: Backend>(&mut self, graph: &mut PlanDag<B>, reset: bool) -> bool {
         let NodeProgress { node, input_index } = self.stack.last().copied().unwrap();
 
         let offset = if !reset && node.parents().iter(&graph).len() < input_index as usize {
@@ -332,10 +328,10 @@ impl ReductionState {
         return false;
     }
 
-    fn reduce_top<'arena, B: Backend, T: ?Sized>(
+    fn reduce_top<'arena, B: Backend>(
         &mut self,
-        reducers: &mut Reducers<B, T>,
-        graph: &mut PlanDag<'_, 'arena, B, T>,
+        reducers: &mut Reducers<B>,
+        graph: &mut PlanDag<'_, 'arena, B>,
         context: &ReductionContext<'arena>,
         alloc: &'arena GraphAllocator,
     ) {
@@ -387,21 +383,21 @@ impl ReductionState {
     }
 }
 
-pub(crate) struct GraphEditor<'a, 'run, 'arena, B: Backend, T: ?Sized> {
+pub(crate) struct GraphEditor<'a, 'run, 'arena, B: Backend> {
     state: &'a mut ReductionState,
-    graph: &'a mut PlanDag<'run, 'arena, B, T>,
+    graph: &'a mut PlanDag<'run, 'arena, B>,
     context: &'a ReductionContext<'arena>,
     alloc: &'arena GraphAllocator,
 }
 
-impl<'a, 'run, 'arena, B: Backend, T: ?Sized> GraphEditor<'a, 'run, 'arena, B, T> {
+impl<'a, 'run, 'arena, B: Backend> GraphEditor<'a, 'run, 'arena, B> {
     #[inline(always)]
-    pub(crate) fn graph(&self) -> &PlanDag<'run, 'arena, B, T> {
+    pub(crate) fn graph(&self) -> &PlanDag<'run, 'arena, B> {
         self.graph
     }
 
     #[inline(always)]
-    pub(crate) fn graph_mut(&mut self) -> &mut PlanDag<'run, 'arena, B, T> {
+    pub(crate) fn graph_mut(&mut self) -> &mut PlanDag<'run, 'arena, B> {
         self.graph
     }
 
@@ -431,7 +427,7 @@ impl<'a, 'run, 'arena, B: Backend, T: ?Sized> GraphEditor<'a, 'run, 'arena, B, T
     }
 
     #[inline(always)]
-    pub(crate) fn insert_node(&mut self, node: PlanNode<'run, B, T>) -> NodeIndex {
+    pub(crate) fn insert_node(&mut self, node: PlanNode<'run, B>) -> NodeIndex {
         self.graph.insert_node(self.alloc, node)
     }
 
@@ -446,7 +442,7 @@ impl<'a, 'run, 'arena, B: Backend, T: ?Sized> GraphEditor<'a, 'run, 'arena, B, T
     }
 }
 
-impl<B: Backend, T: ?Sized> GraphReducer<B, T> {
+impl<B: Backend> GraphReducer<B> {
     pub(crate) fn new() -> Self {
         Self {
             reducers: Vec::new(),
@@ -458,18 +454,18 @@ impl<B: Backend, T: ?Sized> GraphReducer<B, T> {
         }
     }
 
-    pub(crate) fn add_reducer(&mut self, reducer: impl Reducer<B, T> + 'static) {
+    pub(crate) fn add_reducer(&mut self, reducer: impl Reducer<B> + 'static) {
         self.reducers.push(Box::new(reducer));
     }
 
-    pub(crate) fn with_reducer(mut self, reducer: impl Reducer<B, T> + 'static) -> Self {
+    pub(crate) fn with_reducer(mut self, reducer: impl Reducer<B> + 'static) -> Self {
         self.add_reducer(reducer);
         self
     }
 
     pub(crate) fn reduce_graph<'arena>(
         &mut self,
-        graph: &mut PlanDag<'_, 'arena, B, T>,
+        graph: &mut PlanDag<'_, 'arena, B>,
         context: &ReductionContext<'arena>,
         alloc: &'arena GraphAllocator,
     ) {

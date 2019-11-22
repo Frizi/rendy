@@ -31,7 +31,7 @@ impl<K: PartialEq, T> Track<K, T> {
     }
 
     /// Take current value out of the tracked container
-    pub fn take(&mut self) -> Option<T> {
-        self.tracked.take().map(|t| t.1)
+    pub fn into_inner(self) -> Option<T> {
+        self.tracked.map(|t| t.1)
     }
 }

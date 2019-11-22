@@ -58,7 +58,7 @@ macro_rules! graph_decl {
 macro_rules! graph {
 
         ([$alloc:expr], $($tail:tt)*) => {{
-            let mut graph = $crate::new::graph::PlanDag::<$crate::new::test::TestBackend, ()>::new();
+            let mut graph = $crate::new::graph::PlanDag::<$crate::new::test::TestBackend>::new();
             graph.insert_node($alloc, PlanNode::Root);
             graph_decl!(@decl [graph, $alloc], $($tail)*);
             graph
@@ -111,20 +111,17 @@ pub fn assert_equivalent<A: std::fmt::Debug, B: PartialEq + std::fmt::Debug>(
     assert_eq!(expected_topo, actual_topo);
 }
 
-pub(crate) fn visualize_graph<B: rendy_core::hal::Backend, T: ?Sized>(
+pub(crate) fn visualize_graph<B: rendy_core::hal::Backend>(
     write: &mut impl std::io::Write,
-    graph: &PlanDag<B, T>,
+    graph: &PlanDag<B>,
     name: &str,
 ) {
     use crate::new::graph::{PlanEdge, PlanNode};
     use graphy::{EdgeIndex, NodeIndex};
 
-    struct Visualize<'a, 'r, 'b, B: rendy_core::hal::Backend, T: ?Sized>(
-        &'b PlanDag<'r, 'a, B, T>,
-        String,
-    );
+    struct Visualize<'a, 'r, 'b, B: rendy_core::hal::Backend>(&'b PlanDag<'r, 'a, B>, String);
 
-    impl<'a, 'r, 'b, B: rendy_core::hal::Backend, T: ?Sized> Visualize<'a, 'r, 'b, B, T> {
+    impl<'a, 'r, 'b, B: rendy_core::hal::Backend> Visualize<'a, 'r, 'b, B> {
         fn edge_color(&self, index: EdgeIndex) -> &'static str {
             match self.0.get_edge(index).unwrap() {
                 PlanEdge::Effect => "#d119bf",
@@ -149,7 +146,8 @@ pub(crate) fn visualize_graph<B: rendy_core::hal::Backend, T: ?Sized>(
                 PlanNode::ClearBuffer(..) => "#330000",
                 PlanNode::RenderSubpass(..) => "#03c03c",
                 PlanNode::RenderPass(..) => "#03c03c",
-                PlanNode::Run(..) => "#9b03c0",
+                PlanNode::Submission(..) => "#9b03c0",
+                PlanNode::PostSubmit(..) => "#9b03c0",
                 _ => "black",
             }
         }
@@ -221,8 +219,8 @@ pub(crate) fn visualize_graph<B: rendy_core::hal::Backend, T: ?Sized>(
         }
     }
 
-    impl<'a, 'r, 'b, B: rendy_core::hal::Backend, T: ?Sized> dot::Labeller<'b, Item, Edge>
-        for Visualize<'a, 'r, 'b, B, T>
+    impl<'a, 'r, 'b, B: rendy_core::hal::Backend> dot::Labeller<'b, Item, Edge>
+        for Visualize<'a, 'r, 'b, B>
     {
         fn graph_id(&'b self) -> dot::Id<'b> {
             dot::Id::new(std::borrow::Cow::Borrowed(self.1.as_str())).unwrap()
@@ -300,8 +298,8 @@ pub(crate) fn visualize_graph<B: rendy_core::hal::Backend, T: ?Sized>(
         }
     }
 
-    impl<'a, 'r, 'b, B: rendy_core::hal::Backend, T: ?Sized> dot::GraphWalk<'b, Item, Edge>
-        for Visualize<'a, 'r, 'b, B, T>
+    impl<'a, 'r, 'b, B: rendy_core::hal::Backend> dot::GraphWalk<'b, Item, Edge>
+        for Visualize<'a, 'r, 'b, B>
     {
         fn nodes(&'b self) -> dot::Nodes<'b, Item> {
             let nodes = self.0.nodes_indices_iter().map(|n| Item::Node(n));
