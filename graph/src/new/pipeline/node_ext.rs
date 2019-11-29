@@ -8,6 +8,7 @@ use rendy_core::hal::Backend;
 
 pub(crate) trait NodeExt<B: Backend> {
     fn origin(&self, graph: &PlanDag<B>) -> Option<NodeIndex>;
+    fn child_origin(&self, graph: &PlanDag<B>) -> Option<NodeIndex>;
     fn version(&self, graph: &PlanDag<B>) -> Option<NodeIndex>;
     fn child_version(&self, graph: &PlanDag<B>) -> Option<NodeIndex>;
     fn directly_uses(
@@ -33,18 +34,28 @@ impl<B: Backend> NodeExt<B> for NodeIndex {
             .walk_next(graph)
             .map(|t| t.1)
     }
+
+    fn child_origin(&self, graph: &PlanDag<B>) -> Option<NodeIndex> {
+        self.children()
+            .filter(|g: &PlanDag<B>, (e, _)| g[*e].is_origin())
+            .walk_next(graph)
+            .map(|t| t.1)
+    }
+
     fn version(&self, graph: &PlanDag<B>) -> Option<NodeIndex> {
         self.parents()
             .filter(|g: &PlanDag<B>, (e, _)| g[*e].is_version())
             .walk_next(graph)
             .map(|t| t.1)
     }
+
     fn child_version(&self, graph: &PlanDag<B>) -> Option<NodeIndex> {
         self.children()
             .filter(|g: &PlanDag<B>, (e, _)| g[*e].is_version())
             .walk_next(graph)
             .map(|t| t.1)
     }
+
     fn directly_uses(
         &self,
         graph: &PlanDag<B>,

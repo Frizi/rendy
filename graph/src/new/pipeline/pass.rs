@@ -216,7 +216,7 @@ impl<'a, B: Backend> Reducer<B> for CombinePassesReducer {
 
             let pass = editor.graph_mut()[pass_node].pass_mut().unwrap();
             pass.subpasses.push(subpass);
-            pass.deps.extend(new_deps.drain());
+            pass.deps.extend(new_deps.drain(..));
             Reduction::Replace(pass_node)
         } else {
             let mut pass = RenderPassNode::new();
@@ -243,6 +243,38 @@ impl<'a, B: Backend> Reducer<B> for CombinePassesReducer {
         }
     }
 }
+
+// #[derive(Debug)]
+// pub(super) struct BakeAttachmentsReducer;
+
+// impl<'a, B: Backend> Reducer<B> for BakeAttachmentsReducer {
+//     fn reduce(&mut self, editor: &mut GraphEditor<B>, node: NodeIndex) -> Reduction {
+//         if let PlanNode::RenderPass(_) = editor.graph()[node] {
+//             let mut pass_attachments = node
+//                 .parents()
+//                 .filter(|graph: &PlanDag<B>, &(edge, _)| graph[edge].is_pass_attachment());
+
+//             let mut change = false;
+//             while let Some((edge, _)) = pass_attachments.walk_next(editor.graph()) {
+//                 change = true;
+//                 let attachment = std::mem::replace(&mut editor.graph_mut()[edge], PlanEdge::Effect)
+//                     .into_pass_attachment();
+
+//                 match &mut editor.graph_mut()[node] {
+//                     PlanNode::RenderPass(ref mut pass) => {
+//                         pass.attachments.push(attachment);
+//                     }
+//                     _ => unreachable!(),
+//                 }
+//             }
+//             if change {
+//                 return Reduction::Changed;
+//             }
+//         }
+
+//         Reduction::NoChange
+//     }
+// }
 
 fn attachment_ops<B: Backend>(writer_node: &mut PlanNode<B>) -> (AttachmentOps, AttachmentClear) {
     let (clear, load) = match writer_node {
@@ -280,6 +312,7 @@ fn process_new_attachment<B: Backend>(
     let mut attachment = RenderPassAtachment {
         ops,
         stencil_ops: AttachmentOps::DONT_CARE,
+        usage: ref_edge.usage(),
         clear,
         first_access: subpass_index as _,
         last_access: subpass_index as _,
@@ -385,7 +418,7 @@ fn process_existing_attachment<B: Backend>(
         if attachment.first_write.is_none() {
             attachment.first_write = attachment.last_write;
         }
-        deps.extend(attachment.queued_reads.drain().map(
+        deps.extend(attachment.queued_reads.drain(..).map(
             |(read_index, read_stages, read_accesses)| rendy_core::hal::pass::SubpassDependency {
                 passes: rendy_core::hal::pass::SubpassRef::Pass(read_index as _)
                     ..rendy_core::hal::pass::SubpassRef::Pass(subpass_index),

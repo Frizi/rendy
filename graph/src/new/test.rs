@@ -127,10 +127,11 @@ pub(crate) fn visualize_graph<B: rendy_core::hal::Backend>(
                 PlanEdge::Effect => "#d119bf",
                 PlanEdge::Origin => "#ff950f",
                 PlanEdge::Version => "#ff250f",
-                PlanEdge::ImageAccess(_, _) => "#aaaaff",
-                PlanEdge::BufferAccess(_, _) => "#550000",
-                PlanEdge::AttachmentRef(_) => "#44aa99",
-                PlanEdge::PassAttachment(_) => "#44aa99",
+                PlanEdge::ImageAccess(..) => "#aaaaff",
+                PlanEdge::BufferAccess(..) => "#550000",
+                PlanEdge::Wait(..) => "#ff77cc",
+                PlanEdge::AttachmentRef(..) => "#44aa99",
+                PlanEdge::PassAttachment(..) => "#44aa99",
                 // _ => "#aaaaaa",
             }
         }
@@ -138,6 +139,7 @@ pub(crate) fn visualize_graph<B: rendy_core::hal::Backend>(
             match self.0.get_node(index).unwrap() {
                 PlanNode::Root => "#99aaff",
                 PlanNode::Image { .. } => "#0000ff",
+                PlanNode::Semaphore(..) => "#ff3355",
                 PlanNode::ImageVersion => "#2266ff",
                 PlanNode::UndefinedImage => "#2266ff",
                 PlanNode::ClearImage(..) => "#2266ff",

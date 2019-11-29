@@ -10,7 +10,7 @@ use {
 };
 
 mod misc;
-mod node_ext;
+pub(super) mod node_ext;
 mod pass;
 mod subpass;
 
@@ -43,7 +43,7 @@ impl<B: Backend> Pipeline<B> {
             stage2: GraphReducer::new()
                 .with_reducer(CombinePassesReducer)
                 .with_reducer(CombineVersionsReducer),
-            stage3: GraphReducer::new().with_reducer(OrderWritesReducer),
+            stage3: GraphReducer::new().with_reducer(OrderWritesReducer), // .with_reducer(BakeAttachmentsReducer),
         }
     }
     #[inline(never)]

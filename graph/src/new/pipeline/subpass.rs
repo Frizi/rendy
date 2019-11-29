@@ -108,7 +108,7 @@ impl<'a, B: Backend> Reducer<B> for CombineSubpassesReducer {
                 PlanNode::RenderSubpass(ref mut merge_groups),
             )) = editor.graph_mut().node_pair_mut(node, merge_target)
             {
-                merge_groups.extend(this_groups.drain());
+                merge_groups.extend(this_groups.drain(..));
             } else {
                 unreachable!();
             }
@@ -377,7 +377,7 @@ mod test {
             id: ImageId(NodeId(0), id),
             kind: rendy_core::hal::image::Kind::D2(1024, 1024, 1, 1),
             levels: 1,
-            format: rendy_core::hal::format::Format::R32Sfloat,
+            format: rendy_core::hal::format::Format::D32Sfloat,
         })
     }
 

@@ -1,32 +1,32 @@
 use {
-    super::{
-        node::{
-            DynNode, DynNodeBuilder, ExecutionPhase, InternalUse, Node, NodeBuffer, NodeBuildError,
-            NodeBuilder, NodeConstructionError, NodeExecution, NodeExecutionError, NodeId,
-            NodeImage, OutputList, OutputStore, Parameter, PassFn, PostSubmitFn, SubmissionFn,
-        },
-        pipeline::Pipeline,
-        resources::{
-            AttachmentAccess, BufferId, BufferInfo, BufferUsage, ImageId, ImageInfo, ImageLoad,
-            ImageUsage, NodeBufferAccess, NodeImageAccess, NodeVirtualAccess, ResourceId,
-            ResourceUsage, VirtualId, WaitId,
-        },
-        walker::{GraphItem, TopoWithEdges},
-    },
     crate::{
         command::{
-            CommandBuffer, CommandPool, Compute, EitherSubmit, Families, Family, General, Graphics,
-            IndividualReset, InitialState, Level, Queue, QueueId, QueueType, RenderPassEncoder,
-            Supports,
+            CommandBuffer, CommandPool, Compute, EitherSubmit, Families, Family, FamilyId, Fence,
+            General, Graphics, IndividualReset, InitialState, Level, Queue, QueueId, QueueType,
+            RenderPassEncoder, Submission, Submittable, Supports,
         },
         factory::Factory,
         frame::{Fences, Frame, Frames},
+        new::{
+            node::{
+                DynNode, DynNodeBuilder, ExecutionPhase, InternalUse, Node, NodeBuildError,
+                NodeBuilder, NodeConstructionError, NodeExecution, NodeExecutionError, NodeId,
+                OutputList, OutputStore, Parameter, PassFn, PostSubmitFn, SubmissionFn,
+            },
+            pipeline::{node_ext::NodeExt, Pipeline},
+            resources::{
+                AttachmentAccess, BufferId, BufferInfo, BufferUsage, ImageId, ImageInfo, ImageLoad,
+                ImageUsage, NodeBufferAccess, NodeImageAccess, NodeVirtualAccess, ResourceId,
+                ResourceUsage, VirtualId, WaitId, WaitableResource,
+            },
+            walker::Topo,
+        },
         resource::{Buffer, Handle, Image},
     },
     graphy::{EdgeIndex, GraphAllocator, NodeIndex, Walker},
     rendy_core::{
         device_owned,
-        hal::{pass::ATTACHMENT_UNUSED, Backend},
+        hal::{device::Device, pass::ATTACHMENT_UNUSED, Backend},
         DeviceId,
     },
     smallvec::{smallvec, SmallVec},
@@ -35,7 +35,7 @@ use {
 /// A builder type for rendering graph.
 pub struct GraphBuilder<B: Backend, T: ?Sized> {
     nodes: Vec<Box<dyn DynNodeBuilder<B, T>>>,
-    frames_in_flight: u32,
+    frames_in_flight: usize,
 }
 
 impl<B: Backend, T: ?Sized> Default for GraphBuilder<B, T> {
@@ -79,7 +79,7 @@ impl<B: Backend, T: ?Sized> GraphBuilder<B, T> {
     }
 
     /// Choose number of frames in flight for the graph
-    pub fn with_frames_in_flight(mut self, frames_in_flight: u32) -> Self {
+    pub fn with_frames_in_flight(mut self, frames_in_flight: usize) -> Self {
         self.frames_in_flight = frames_in_flight;
         self
     }
@@ -106,9 +106,7 @@ impl<B: Backend, T: ?Sized> GraphBuilder<B, T> {
                     .collect::<Result<_, GraphBuildError>>()?,
             ),
             alloc: GraphAllocator::with_capacity(52_428_800),
-            frames: Frames::new(),
             resources: GraphResourcePool::new(factory, families, self.frames_in_flight),
-            inflight: self.frames_in_flight,
         })
     }
 }
@@ -128,63 +126,162 @@ pub struct RenderPassInfo {}
 struct GraphResourcePool<B: Backend> {
     // TODO: allocate, pool and recycle semaphores
     semaphores: Vec<B::Semaphore>,
-    fences: Vec<Fences<B>>,
+    recycled_semaphores: Vec<B::Semaphore>,
+    fences_used: usize,
+    fences: Option<Fences<B>>,
     render_passes: HashMap<RenderPassInfo, Vec<B::RenderPass>>,
     // general family might not be present, as opengl might not handle compute
     // This should always be available on conformant vulkan implementation,
-    general_family: Option<FamilyResources<B>>,
-    graphics_family: Option<FamilyResources<B>>,
     // @Incomplete: maybe handle dedicated transfer queue on the graph
-    // transfer_family: Option<FamilyResources<B, Transfer>>,
-    async_compute_family: Option<FamilyResources<B>>,
+    general_family: Option<FamilyId>,
+    graphics_family: Option<FamilyId>,
+    async_compute_family: Option<FamilyId>,
+    family_res: Vec<Option<FamilyResources<B>>>,
+    frames: Frames<B>,
+    frames_in_flight: usize,
 }
 
 impl<B: Backend> GraphResourcePool<B> {
-    fn new(factory: &mut Factory<B>, families: &mut Families<B>, frames_in_flight: u32) -> Self {
-        // TODO: ensure that primary graphics family support presentation
+    unsafe fn dispose(self, factory: &Factory<B>) {
+        self.frames.dispose(factory);
+        for semaphore in self.semaphores {
+            factory.destroy_semaphore(semaphore);
+        }
+        for semaphore in self.recycled_semaphores {
+            factory.destroy_semaphore(semaphore);
+        }
+        for fences in self.fences {
+            for fence in fences {
+                factory.destroy_fence(fence);
+            }
+        }
+        for (_, passes) in self.render_passes {
+            for pass in passes {
+                factory.device().destroy_render_pass(pass);
+            }
+        }
+        for res in self.family_res {
+            if let Some(res) = res {
+                res.dispose(factory);
+            }
+        }
+    }
 
-        let general_family = families.with_capability::<General>();
+    fn new(factory: &mut Factory<B>, families: &mut Families<B>, frames_in_flight: usize) -> Self {
+        let general_family_id = families.with_capability::<General>();
         // select graphics-only family if general is not available (webgl case)
-        let graphics_family = match general_family {
+        let graphics_family_id = match general_family_id {
             None => families.with_capability::<Graphics>(),
             _ => None,
         };
 
-        // some graphics family must be available
-        assert!(general_family.is_some() || graphics_family.is_some());
+        // @Robustness: Ensure that primary graphics family support presentation.
+        // This can be done by checking at initial device selection.
+        // Now we just fail late at this assert if a non-graphics device happen to be selected.
+        assert!(general_family_id.is_some() || graphics_family_id.is_some());
 
-        let async_compute_family =
+        let async_compute_family_id =
             // find dedicated compute-only family
             families.find(|family| family.capability() == QueueType::Compute)
             .or_else(|| {
                 // find compute-capable family different from other families
                 families.find(|family| {
-                    Some(family.id()) != general_family &&
-                    Some(family.id()) != graphics_family &&
+                    Some(family.id()) != general_family_id &&
+                    Some(family.id()) != graphics_family_id &&
                     Supports::<Compute>::supports(&family.capability()).is_some()
                 })
             });
 
-        // TODO(braindump):
-        // family ids are chosen now (still validate vkGetPhysicalDeviceSurfaceSupportKHR)
-        // so acquire them one by one and create resources for them (FamilyResources::new)
-        // then finish command buffer pool management and stuff
-        // then manage semaphore pool
-        // then finally fences
-        // fences are only used directly by the graph on submissions.
-        // semaphores are accessible for nodes somewhat, so we need to manage them.
+        let max = 1 + general_family_id
+            .map(|i| i.index)
+            .max(graphics_family_id.map(|i| i.index))
+            .max(async_compute_family_id.map(|i| i.index))
+            .unwrap();
+
+        let mut family_res = Vec::with_capacity(max);
+        for _ in 0..max {
+            family_res.push(None);
+        }
+
+        if let Some(family_id) = general_family_id {
+            family_res[family_id.index] = Some(FamilyResources::new(
+                factory,
+                families.family_mut(family_id),
+                frames_in_flight,
+            ));
+        }
+        if let Some(family_id) = graphics_family_id {
+            family_res[family_id.index] = Some(FamilyResources::new(
+                factory,
+                families.family_mut(family_id),
+                frames_in_flight,
+            ));
+        }
+        if let Some(family_id) = async_compute_family_id {
+            family_res[family_id.index] = Some(FamilyResources::new(
+                factory,
+                families.family_mut(family_id),
+                frames_in_flight,
+            ));
+        }
 
         Self {
             semaphores: Vec::new(),
-            fences: Vec::new(),
+            recycled_semaphores: Vec::new(),
+            fences_used: 0,
+            fences: None,
             render_passes: HashMap::new(),
-            general_family: general_family
-                .map(|id| FamilyResources::new(factory, families.family_mut(id), frames_in_flight)),
-            graphics_family: graphics_family
-                .map(|id| FamilyResources::new(factory, families.family_mut(id), frames_in_flight)),
-            async_compute_family: async_compute_family
-                .map(|id| FamilyResources::new(factory, families.family_mut(id), frames_in_flight)),
+            frames: Frames::new(),
+            frames_in_flight,
+            general_family: general_family_id,
+            graphics_family: graphics_family_id,
+            async_compute_family: async_compute_family_id,
+            family_res,
         }
+    }
+
+    fn begin_frame(&mut self, factory: &Factory<B>) {
+        if self.frames.next().index() >= self.frames_in_flight as _ {
+            let wait = Frame::with_index(self.frames.next().index() - self.frames_in_flight as u64);
+            let fences = &mut self.fences;
+            self.frames
+                .wait_complete(wait, factory, |mut frame_fences| {
+                    factory.reset_fences(&mut frame_fences).unwrap();
+                    assert!(fences.is_none());
+                    fences.replace(frame_fences);
+                });
+        }
+
+        self.fences_used = 0;
+        if self.fences.is_none() {
+            self.fences.replace(Fences::default());
+        }
+    }
+
+    fn end_frame(&mut self, factory: &Factory<B>) {
+        let mut fences = self
+            .fences
+            .take()
+            .expect("end_frame called without matching begin_frame");
+
+        for fence in fences.drain(self.fences_used..) {
+            factory.destroy_fence(fence);
+        }
+
+        self.frames.advance(fences);
+        self.semaphores.extend(self.recycled_semaphores.drain(..));
+    }
+
+    fn get_semaphore_to_signal(&mut self, factory: &Factory<B>) -> B::Semaphore {
+        if let Some(semaphore) = self.semaphores.pop() {
+            semaphore
+        } else {
+            factory.create_semaphore().unwrap()
+        }
+    }
+
+    fn recycle_semaphores(&mut self, semaphores: impl IntoIterator<Item = B::Semaphore>) {
+        self.recycled_semaphores.extend(semaphores);
     }
 
     // fn request_render_pass(&mut self, info: RenderPassInfo, compatible: bool) &B::RenderPass
@@ -202,38 +299,36 @@ impl<B: Backend> GraphResourcePool<B> {
         unimplemented!()
     }
 
-    fn family_data_mut(&mut self, family_type: FamilyType) -> Option<&mut FamilyResources<B>> {
+    fn family_id(&self, family_type: FamilyType) -> Option<FamilyId> {
         match family_type {
-            FamilyType::Graphics => self
-                .general_family
-                .as_mut()
-                .or(self.graphics_family.as_mut()),
-            FamilyType::Compute => self
-                .general_family
-                .as_mut()
-                .or(self.async_compute_family.as_mut()),
-            FamilyType::AsyncCompute => self
-                .async_compute_family
-                .as_mut()
-                .or(self.general_family.as_mut()),
+            FamilyType::Graphics => self.general_family.or(self.graphics_family),
+            FamilyType::Compute => self.general_family.or(self.async_compute_family),
+            FamilyType::AsyncCompute => self.async_compute_family.or(self.general_family),
+        }
+    }
+
+    fn family_data_mut(&mut self, family_type: FamilyType) -> Option<&mut FamilyResources<B>> {
+        match self.family_id(family_type) {
+            Some(id) => self.family_res[id.index].as_mut(),
+            None => None,
         }
     }
 
     fn family_data(&self, family_type: FamilyType) -> Option<&FamilyResources<B>> {
-        match family_type {
-            FamilyType::Graphics => self
-                .general_family
-                .as_ref()
-                .or(self.graphics_family.as_ref()),
-            FamilyType::Compute => self
-                .general_family
-                .as_ref()
-                .or(self.async_compute_family.as_ref()),
-            FamilyType::AsyncCompute => self
-                .async_compute_family
-                .as_ref()
-                .or(self.general_family.as_ref()),
+        match self.family_id(family_type) {
+            Some(id) => self.family_res[id.index].as_ref(),
+            None => None,
         }
+    }
+
+    fn family_data_or_panic(&self, family_type: FamilyType) -> &FamilyResources<B> {
+        self.family_data(family_type)
+            .unwrap_or_else(|| panic!("Family matching type {:?} not found", family_type))
+    }
+
+    fn family_data_mut_or_panic(&mut self, family_type: FamilyType) -> &mut FamilyResources<B> {
+        self.family_data_mut(family_type)
+            .unwrap_or_else(|| panic!("Family matching type {:?} not found", family_type))
     }
 
     fn allocate_buffers<L: Level>(
@@ -241,16 +336,44 @@ impl<B: Backend> GraphResourcePool<B> {
         family_type: FamilyType,
         count: usize,
     ) -> Vec<CommandBuffer<B, QueueType, InitialState, L, IndividualReset>> {
-        self.family_data_mut(family_type)
-            .unwrap_or_else(|| panic!("Family matching type {:?} not found", family_type))
+        self.family_data_mut_or_panic(family_type)
             .pool
             .allocate_buffers(count)
     }
 
     fn queue(&self, family_type: FamilyType) -> QueueId {
-        self.family_data(family_type)
-            .unwrap_or_else(|| panic!("Family matching type {:?} not found", family_type))
-            .queue_id
+        self.family_data_or_panic(family_type).queue_id
+    }
+
+    pub fn flush<'a>(
+        &mut self,
+        factory: &Factory<B>,
+        families: &mut Families<B>,
+        family_id: FamilyId,
+        submits: impl IntoIterator<Item = impl Submittable<B>>,
+        waits: impl IntoIterator<Item = (&'a B::Semaphore, rendy_core::hal::pso::PipelineStage)>,
+        signals: impl IntoIterator<Item = &'a B::Semaphore>,
+        use_fence: bool,
+    ) {
+        if let Some(family_data) = self.family_res[family_id.index].as_mut() {
+            let fence = if use_fence {
+                let fences = self
+                    .fences
+                    .as_mut()
+                    .expect("flush called outside of begin_frame and end_frame");
+                if fences.len() <= self.fences_used {
+                    fences.push(factory.create_fence(false).unwrap());
+                }
+                self.fences_used += 1;
+                Some(&mut fences[self.fences_used - 1])
+            } else {
+                None
+            };
+
+            family_data.flush(families, submits, waits, signals, fence);
+        } else {
+            panic!("Trying to flush nonexistent family {:?}", family_id);
+        }
     }
 }
 
@@ -264,7 +387,7 @@ struct FamilyResources<B: Backend> {
 }
 
 impl<B: Backend> FamilyResources<B> {
-    fn new(factory: &mut Factory<B>, family: &mut Family<B>, frames_in_flight: u32) -> Self {
+    fn new(factory: &mut Factory<B>, family: &mut Family<B>, frames_in_flight: usize) -> Self {
         // @Incomplete: Use frame_in_flights to preallocate per-frame per-family resources
         let _ = frames_in_flight;
 
@@ -278,6 +401,41 @@ impl<B: Backend> FamilyResources<B> {
                 .expect("Failed to initialize family command pool"),
         }
     }
+
+    pub fn flush<'a>(
+        &mut self,
+        families: &mut Families<B>,
+        submits: impl IntoIterator<Item = impl Submittable<B>>,
+        waits: impl IntoIterator<Item = (&'a B::Semaphore, rendy_core::hal::pso::PipelineStage)>,
+        signals: impl IntoIterator<Item = &'a B::Semaphore>,
+        fence: Option<&mut Fence<B>>,
+    ) {
+        let family = self.queue_id.family;
+        unsafe {
+            families.queue_mut(self.queue_id).submit(
+                Some(
+                    Submission::new()
+                        .submits(submits.into_iter().map(|submit| {
+                            if submit.family() != family {
+                                panic!(
+                                    "Trying to submit to a wrong queue: expected {:?}, got {:?}",
+                                    family,
+                                    submit.family()
+                                );
+                            }
+                            submit
+                        }))
+                        .wait(waits)
+                        .signal(signals),
+                ),
+                fence,
+            );
+        }
+    }
+
+    unsafe fn dispose(self, factory: &Factory<B>) {
+        factory.destroy_command_pool(self.pool);
+    }
 }
 
 /// A built runnable top-level rendering graph.
@@ -286,9 +444,7 @@ pub struct Graph<B: Backend, T: ?Sized> {
     nodes: GraphNodes<B, T>,
     pipeline: Pipeline<B>,
     alloc: GraphAllocator,
-    frames: Frames<B>,
     resources: GraphResourcePool<B>,
-    inflight: u32,
 }
 
 device_owned!(Graph<B, T: ?Sized>);
@@ -300,9 +456,7 @@ impl<B: Backend, T: ?Sized> std::fmt::Debug for Graph<B, T> {
             .field("nodes", &self.nodes)
             .field("pipeline", &self.pipeline)
             .field("alloc", &self.alloc)
-            .field("frames", &self.frames)
             .field("resources", &self.resources)
-            .field("inflight", &self.inflight)
             .finish()
     }
 }
@@ -316,6 +470,20 @@ impl<B: Backend, T: ?Sized> std::fmt::Debug for GraphNodes<B, T> {
 }
 
 impl<B: Backend, T: ?Sized> Graph<B, T> {
+    /// Dispose of the `Graph`.
+    pub fn dispose(self, factory: &mut Factory<B>, data: &T) {
+        assert!(factory.wait_idle().is_ok());
+        // As wait_idle was just called, the disposes are safe.
+        for node in self.nodes.0 {
+            unsafe {
+                node.dispose(factory, data);
+            }
+        }
+        unsafe {
+            self.resources.dispose(factory);
+        }
+    }
+
     /// Construct, schedule and run all nodes of rendering graph.
     pub fn run(
         &mut self,
@@ -330,37 +498,16 @@ impl<B: Backend, T: ?Sized> Graph<B, T> {
         }
 
         let nodes = &mut self.nodes;
-        let mut run_ctx = ConstructContext::new(
-            factory,
-            families,
-            &mut self.frames,
-            &mut self.resources,
-            &self.alloc,
-        );
+        let mut run_ctx =
+            ConstructContext::new(factory, families, &mut self.resources, &self.alloc);
+        run_ctx.resources.begin_frame(&mut run_ctx.factory);
+
         nodes.run_construction_phase(&mut run_ctx, aux)?;
-
         self.pipeline.reduce(&mut run_ctx.graph.dag, &self.alloc);
-
-        if run_ctx.frames.next().index() >= self.inflight as _ {
-            let wait = Frame::with_index(run_ctx.frames.next().index() - self.inflight as u64);
-            let res_fences = &mut run_ctx.resources.fences;
-            run_ctx
-                .frames
-                .wait_complete(wait, factory, |mut frame_fences| {
-                    factory.reset_fences(&mut frame_fences).unwrap();
-                    res_fences.push(frame_fences);
-                });
-        }
-
-        // TODO: provide fences and semaphores
-        let fences = run_ctx.resources.fences.pop().unwrap_or_default();
-        let fences_used = 0;
-        // let semaphores = &run_ctx.resources.semaphores;
-
         run_ctx.run_execution_phase()?;
 
-        self.resources.fences.truncate(fences_used);
-        self.frames.advance(fences);
+        self.resources.end_frame(factory);
+
         Ok(())
     }
 }
@@ -394,7 +541,7 @@ impl<B: Backend, T: ?Sized> GraphNodes<B, T> {
             }
         }
 
-        for (i, seed, execution) in outputs.drain().rev() {
+        for (i, seed, execution) in outputs.drain(..).rev() {
             run_ctx
                 .graph
                 .insert(NodeId(i), seed, execution)
@@ -429,7 +576,7 @@ pub struct BufferToken<'run>(BufferId, PhantomData<&'run ()>);
 /// Semaphore must be used during the execution.
 #[derive(Debug, Clone, Copy)]
 #[must_use]
-pub struct WaitSemaphoreToken<'run>(WaitId, PhantomData<&'run ()>);
+pub struct SemaphoreToken<'run>(WaitId, PhantomData<&'run ()>);
 
 impl ImageToken<'_> {
     fn new(id: ImageId) -> Self {
@@ -449,7 +596,7 @@ impl BufferToken<'_> {
     }
 }
 
-impl WaitSemaphoreToken<'_> {
+impl SemaphoreToken<'_> {
     fn new(id: WaitId) -> Self {
         Self(id, PhantomData)
     }
@@ -465,6 +612,9 @@ pub trait NodeCtx<'run, B: Backend> {
 
     /// Create new image owned by graph.
     fn create_image(&mut self, image_info: ImageInfo) -> ImageId;
+
+    fn create_semaphore(&mut self) -> B::Semaphore;
+    fn recycle_semaphores(&mut self, semaphores: impl IntoIterator<Item = B::Semaphore>);
 
     /// Provide node owned image into the graph for single frame.
     /// Provide `acquire` semaphore that must be waited on before the image is first accessed on any queue.
@@ -530,8 +680,9 @@ pub trait NodeCtx<'run, B: Backend> {
 
     fn wait_semaphore(
         &mut self,
+        resource_id: impl WaitableResource,
         stages: rendy_core::hal::pso::PipelineStage,
-    ) -> WaitSemaphoreToken<'run>;
+    ) -> SemaphoreToken<'run>;
 }
 
 impl<'ctx, 'run, 'arena, B: Backend> NodeContext<'ctx, 'run, 'arena, B> {
@@ -557,6 +708,14 @@ impl<'ctx, 'run, 'arena, B: Backend> NodeContext<'ctx, 'run, 'arena, B> {
 impl<'run, B: Backend> NodeCtx<'run, B> for NodeContext<'_, 'run, '_, B> {
     fn factory(&self) -> &'run Factory<B> {
         self.run.factory
+    }
+
+    fn create_semaphore(&mut self) -> B::Semaphore {
+        self.run.resources.get_semaphore_to_signal(self.run.factory)
+    }
+
+    fn recycle_semaphores(&mut self, semaphores: impl IntoIterator<Item = B::Semaphore>) {
+        self.run.resources.recycle_semaphores(semaphores)
     }
 
     fn get_parameter<P: Any>(&self, id: Parameter<P>) -> Result<&P, NodeConstructionError> {
@@ -662,10 +821,14 @@ impl<'run, B: Backend> NodeCtx<'run, B> for NodeContext<'_, 'run, '_, B> {
 
     fn wait_semaphore(
         &mut self,
+        resource_id: impl WaitableResource,
         stages: rendy_core::hal::pso::PipelineStage,
-    ) -> WaitSemaphoreToken<'run> {
-        let wait_id = self.run.graph.wait_semaphore(self.seed, stages);
-        WaitSemaphoreToken::new(wait_id)
+    ) -> SemaphoreToken<'run> {
+        let wait_id = self
+            .run
+            .graph
+            .wait_semaphore(self.seed, resource_id.id(), stages);
+        SemaphoreToken::new(wait_id)
     }
 }
 
@@ -713,10 +876,12 @@ pub(crate) enum PlanNode<'n, B: Backend> {
     /// Resolve multisampled image into non-multisampled one.
     /// Currently this works under asumption that all layers of source image are resolved into first layer of destination.
     ResolveImage,
-    /// A semaphore that is waited on before any child node can be executed
-    WaitSemaphore(WaitId, rendy_core::hal::pso::PipelineStage),
+    /// A semaphore that is signalled before any child node can be executed, so it can be waited on by that node
+    Semaphore(WaitId),
     /// Graph root node. All incoming nodes are always evaluated.
     Root,
+    /// Graph node placeholders for nodes that were evaluated and taken out by value.
+    Evaluated,
 }
 
 impl<'n, B: Backend> PlanNode<'n, B> {
@@ -821,6 +986,17 @@ impl AttachmentRefEdge {
             }
         }
     }
+
+    pub(crate) fn usage(&self) -> rendy_core::hal::image::Usage {
+        use rendy_core::hal::image::Usage;
+        match self {
+            AttachmentRefEdge::Color(..) | AttachmentRefEdge::Resolve(..) => {
+                Usage::COLOR_ATTACHMENT
+            }
+            AttachmentRefEdge::Input(..) => Usage::INPUT_ATTACHMENT,
+            AttachmentRefEdge::DepthStencil(_) => Usage::DEPTH_STENCIL_ATTACHMENT,
+        }
+    }
 }
 
 pub(crate) struct RenderPassSubpass<'n, B: Backend> {
@@ -902,24 +1078,22 @@ impl<'n, B: Backend> RenderPassSubpass<'n, B> {
 
 #[derive(Debug)]
 pub(crate) struct RenderPassNode<'run, B: Backend> {
-    pub(crate) attachments: SmallVec<[RenderPassAtachment; 8]>,
     pub(crate) subpasses: SmallVec<[RenderPassSubpass<'run, B>; 4]>,
     pub(crate) deps: SmallVec<[rendy_core::hal::pass::SubpassDependency; 32]>,
+    
 }
-
 impl<'run, B: Backend> RenderPassNode<'run, B> {
     pub(crate) fn new() -> Self {
         Self {
-            attachments: SmallVec::new(),
             subpasses: SmallVec::new(),
             deps: SmallVec::new(),
         }
     }
 
-    fn run(self, general_ctx: ExecContext<'_, 'run, B>) {
+    fn run(self, ctx: &mut ExecContext<'run, B>) {
         assert!(self.subpasses.len() > 0);
 
-        let pass_info = unimplemented!();
+        // let pass_info = unimplemented!();
         // let render_pass = general_ctx.request_render_pass(&self);
 
         // let queue: &mut Queue<B> = general_ctx.queue_mut(FamilyType::Graphics);
@@ -953,6 +1127,7 @@ impl<'run, B: Backend> RenderPassNode<'run, B> {
 pub(crate) struct RenderPassAtachment {
     pub(crate) ops: rendy_core::hal::pass::AttachmentOps,
     pub(crate) stencil_ops: rendy_core::hal::pass::AttachmentOps,
+    pub(crate) usage: rendy_core::hal::image::Usage,
     pub(crate) clear: AttachmentClear,
     pub(crate) first_access: u8,
     pub(crate) last_access: u8,
@@ -1024,6 +1199,8 @@ pub(crate) enum PlanEdge {
     /// Target node accesses connected source image version.
     BufferAccess(NodeBufferAccess, rendy_core::hal::pso::PipelineStage),
     ImageAccess(NodeImageAccess, rendy_core::hal::pso::PipelineStage),
+    /// Wait for semaphore
+    Wait(rendy_core::hal::pso::PipelineStage),
     /// A node-to-node execution order dependency
     Effect,
     /// Resource version relation. Version increases in the edge direction
@@ -1045,9 +1222,7 @@ impl<'n, B: Backend> std::fmt::Debug for PlanNode<'n, B> {
             PlanNode::BufferVersion => fmt.debug_tuple("BufferVersion").finish(),
             PlanNode::UndefinedImage => fmt.debug_tuple("UndefinedImage").finish(),
             PlanNode::UndefinedBuffer => fmt.debug_tuple("UndefinedBuffer").finish(),
-            PlanNode::WaitSemaphore(i, s) => {
-                fmt.debug_tuple("WaitSemaphore").field(i).field(s).finish()
-            }
+            PlanNode::Semaphore(i) => fmt.debug_tuple("Semaphore").field(i).finish(),
             PlanNode::RenderSubpass(vec) => fmt
                 .debug_tuple(&format!("RenderSubpass[{}]", vec.len()))
                 .finish(),
@@ -1065,6 +1240,7 @@ impl<'n, B: Backend> std::fmt::Debug for PlanNode<'n, B> {
             PlanNode::Submission(..) => fmt.debug_tuple("Submission").finish(),
             PlanNode::PostSubmit(..) => fmt.debug_tuple("PostSubmit").finish(),
             PlanNode::ResolveImage => fmt.debug_tuple("ResolveImage").finish(),
+            PlanNode::Evaluated => fmt.debug_tuple("Evaluated").finish(),
             PlanNode::Root => fmt.debug_tuple("Root").finish(),
         }
     }
@@ -1081,6 +1257,12 @@ impl PlanEdge {
         match self {
             PlanEdge::PassAttachment(attachment) => Some(attachment),
             _ => None,
+        }
+    }
+    pub(crate) fn into_pass_attachment(self) -> RenderPassAtachment {
+        match self {
+            PlanEdge::PassAttachment(attachment) => attachment,
+            _ => panic!("Not a pass attachment"),
         }
     }
     pub(crate) fn pass_attachment_mut(&mut self) -> Option<&mut RenderPassAtachment> {
@@ -1177,12 +1359,13 @@ impl<'run, 'arena, B: Backend> PlanGraph<'run, 'arena, B> {
     fn wait_semaphore(
         &mut self,
         seed: &mut NodeSeed,
+        resource_id: ResourceId,
         stages: rendy_core::hal::pso::PipelineStage,
     ) -> WaitId {
         let id = WaitId(self.semaphores);
         self.semaphores += 1;
         self.resource_usage
-            .push(ResourceUsage::WaitSemaphore(id, stages));
+            .push(ResourceUsage::Semaphore(id, resource_id, stages));
         seed.resources.end += 1;
         id
     }
@@ -1473,79 +1656,33 @@ impl<'run, 'arena, B: Backend> PlanGraph<'run, 'arena, B> {
                         self.last_writes.insert(ResourceId::Image(id), version);
                     }
                 }
-                ResourceUsage::WaitSemaphore(id, stage) => {
-                    let semaphore_node = self
-                        .dag
-                        .insert_node(self.alloc, PlanNode::WaitSemaphore(id, stage));
+                ResourceUsage::Semaphore(id, res_id, stage) => {
+                    let semaphore_node = self.dag.insert_node(self.alloc, PlanNode::Semaphore(id));
                     self.dag
-                        .insert_edge_unchecked(self.alloc, semaphore_node, node, PlanEdge::Effect)
+                        .insert_edge_unchecked(
+                            self.alloc,
+                            semaphore_node,
+                            node,
+                            PlanEdge::Wait(stage),
+                        )
                         .unwrap();
+
+                    if let Some(last_version) = self.last_writes.get(&res_id).copied() {
+                        self.dag
+                            .insert_edge_unchecked(
+                                self.alloc,
+                                last_version,
+                                semaphore_node,
+                                PlanEdge::Origin,
+                            )
+                            .unwrap();
+                    }
                 }
             }
         }
         Ok(())
     }
 }
-
-#[derive(Debug)]
-pub struct ExecContext<'ctx, 'run, B: Backend> {
-    factory: &'ctx Factory<B>,
-    families: &'ctx mut Families<B>,
-    images: HashMap<ImageId, NodeImage<B>>,
-    buffers: HashMap<BufferId, NodeBuffer<B>>,
-    frames: &'ctx Frames<B>,
-    resources: &'ctx mut GraphResourcePool<B>,
-    submits: &'ctx mut Vec<EitherSubmit<'run, B>>,
-    indexed_waits: &'ctx HashMap<WaitId, usize>,
-    wait_semaphores: &'ctx [B::Semaphore],
-}
-
-impl<'ctx, 'run, B: Backend> ExecContext<'ctx, 'run, B> {
-    pub(crate) fn new() -> Self {
-        unimplemented!()
-    }
-
-    pub fn queue_mut(&mut self, family_type: FamilyType) -> &mut Queue<B> {
-        self.families.queue_mut(self.resources.queue(family_type))
-    }
-
-    pub fn request_render_pass(&mut self, pass_info: RenderPassInfo) -> &B::RenderPass {
-        self.resources.request_render_pass(self.factory, pass_info)
-    }
-
-    pub fn submit<C>(&mut self, submits: C)
-    where
-        C: IntoIterator,
-        C::Item: Into<EitherSubmit<'run, B>>,
-    {
-        self.submits.extend(submits.into_iter().map(Into::into))
-    }
-
-    pub fn get_image(&self, token: ImageToken) -> &NodeImage<B> {
-        self.images
-            .get(&token.id())
-            .expect("Somehow got a token to unscheduled image")
-    }
-
-    pub fn get_buffer(&self, token: BufferToken) -> &NodeBuffer<B> {
-        self.buffers
-            .get(&token.id())
-            .expect("Somehow got a token to unscheduled buffer")
-    }
-
-    pub fn get_semaphore(&self, token: WaitSemaphoreToken) -> &'ctx B::Semaphore {
-        let index = self
-            .indexed_waits
-            .get(&token.id())
-            .expect("Somehow got a token to unscheduled semaphore");
-        &self.wait_semaphores[*index]
-    }
-
-    pub fn frames(&self) -> &Frames<B> {
-        self.frames
-    }
-}
-
 #[derive(Debug)]
 pub struct ExecPassContext<'a, B: Backend> {
     factory: &'a Factory<B>,
@@ -1577,7 +1714,6 @@ impl<'a, B: Backend> ExecPassContext<'a, B> {
 struct ConstructContext<'run, 'arena, B: Backend> {
     factory: &'run Factory<B>,
     families: &'run mut Families<B>,
-    frames: &'run mut Frames<B>,
     resources: &'run mut GraphResourcePool<B>,
     output_store: OutputStore,
     images: HashMap<ImageId, (Handle<Image<B>>, Option<B::Semaphore>)>,
@@ -1585,22 +1721,16 @@ struct ConstructContext<'run, 'arena, B: Backend> {
     graph: PlanGraph<'run, 'arena, B>,
 }
 
-// struct FrameContext<'run, B: Backend> {
-
-// }
-
 impl<'run, 'arena, B: Backend> ConstructContext<'run, 'arena, B> {
     fn new(
         factory: &'run Factory<B>,
         families: &'run mut Families<B>,
-        frames: &'run mut Frames<B>,
         resources: &'run mut GraphResourcePool<B>,
         allocator: &'arena GraphAllocator,
     ) -> Self {
         Self {
             factory,
             families,
-            frames,
             resources,
             output_store: OutputStore::new(),
             images: HashMap::new(),
@@ -1623,142 +1753,380 @@ impl<'run, 'arena, B: Backend> ConstructContext<'run, 'arena, B> {
     }
 
     fn run_execution_phase(self) -> Result<(), GraphRunError> {
-        let topo: Vec<_> = TopoWithEdges::new(&self.graph.dag, NodeIndex::new(0))
-            .iter(&self.graph.dag)
+        let ctx = ExecContext {
+            factory: self.factory,
+            families: self.families,
+            resources: self.resources,
+            images: self.images,
+            buffers: self.buffers,
+            submit_data: HashMap::new(),
+            semaphores: ExecSemaphores::new(),
+        };
+
+        ctx.run(self.graph)
+    }
+}
+
+#[derive(Debug)]
+pub struct ExecContext<'run, B: Backend> {
+    pub factory: &'run Factory<B>,
+    pub families: &'run mut Families<B>,
+    resources: &'run mut GraphResourcePool<B>,
+    images: HashMap<ImageId, (Handle<Image<B>>, Option<B::Semaphore>)>,
+    buffers: HashMap<BufferId, Handle<Buffer<B>>>,
+    submit_data: HashMap<FamilyId, SubmitData<'run, B>>,
+    pub semaphores: ExecSemaphores<B>,
+}
+
+#[derive(Debug)]
+struct SubmitData<'run, B: Backend> {
+    submits: Vec<EitherSubmit<'run, B>>,
+    waits: Vec<(usize, rendy_core::hal::pso::PipelineStage)>,
+    signals: Vec<usize>,
+}
+
+impl<B: Backend> Default for SubmitData<'_, B> {
+    fn default() -> Self {
+        Self {
+            submits: Vec::new(),
+            waits: Vec::new(),
+            signals: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct ExecSemaphores<B: Backend> {
+    semaphores: Vec<B::Semaphore>,
+    indexed_semaphores: HashMap<WaitId, usize>,
+}
+
+impl<B: Backend> ExecSemaphores<B> {
+    fn new() -> Self {
+        Self {
+            semaphores: Vec::new(),
+            indexed_semaphores: HashMap::new(),
+        }
+    }
+
+    fn insert_indexed(&mut self, semaphore: B::Semaphore, wait_id: WaitId) -> usize {
+        let index = self.semaphores.len();
+        self.semaphores.push(semaphore);
+        self.indexed_semaphores.insert(wait_id, index);
+        index
+    }
+
+    fn get_index(&self, wait_id: WaitId) -> Option<usize> {
+        self.indexed_semaphores.get(&wait_id).copied()
+    }
+
+    fn get_by_index(&self, index: usize) -> &B::Semaphore {
+        &self.semaphores[index]
+    }
+
+    fn get(&self, wait_id: WaitId) -> Option<&B::Semaphore> {
+        let index = self.get_index(wait_id)?;
+        Some(&self.semaphores[index])
+    }
+
+    fn recycle(&mut self, resources: &mut GraphResourcePool<B>) {
+        resources.recycle_semaphores(self.semaphores.drain(..));
+        self.indexed_semaphores.clear();
+    }
+}
+
+impl<B: Backend> std::ops::Index<SemaphoreToken<'_>> for ExecSemaphores<B> {
+    type Output = B::Semaphore;
+    fn index(&self, token: SemaphoreToken) -> &B::Semaphore {
+        self.get(token.id())
+            .expect("Trying to index by token without backing value")
+    }
+}
+
+impl<B: Backend> SubmitData<'_, B> {
+    fn needs_flush(&self) -> bool {
+        self.signals.len() > 0
+    }
+}
+
+impl<'run, B: Backend> ExecContext<'run, B> {
+    fn flush_all(&mut self, use_fence: bool) {
+        let graphics_id = self.resources.family_id(FamilyType::Graphics);
+        let compute_id = self.resources.family_id(FamilyType::Compute);
+        let async_compute_id = self.resources.family_id(FamilyType::AsyncCompute);
+
+        if let Some(id) = graphics_id {
+            self.flush_family(id, use_fence, false);
+        }
+        if compute_id != graphics_id {
+            if let Some(id) = compute_id {
+                self.flush_family(id, use_fence, false);
+            }
+        }
+        if async_compute_id != compute_id && async_compute_id != graphics_id {
+            if let Some(id) = async_compute_id {
+                self.flush_family(id, use_fence, false);
+            }
+        }
+    }
+
+    fn run(mut self, mut graph: PlanGraph<'run, '_, B>) -> Result<(), GraphRunError> {
+        let topo: Vec<_> = Topo::new(&graph.dag, NodeIndex::new(0))
+            .iter(&graph.dag)
             .collect();
 
-        let (mut nodes, mut edges) = self.graph.dag.into_items();
-
-        // TODO: flushing and submits must be per family
-        let mut flush_before_next = false;
-        let mut submits = Vec::new();
-        let mut wait_semaphores = Vec::new();
-        let mut wait_stages = Vec::new();
-        let mut flush_before_next = false;
-        let mut indexed_waits = HashMap::new();
-
-        let total_submits = nodes
-            .iter()
-            .filter(|node| match node {
-                PlanNode::RenderPass(..) | PlanNode::Submission(..) => true,
+        fn node_can_submit<B: Backend>(node: &PlanNode<B>) -> bool {
+            match node {
+                PlanNode::RenderPass(..) => true,
+                PlanNode::Submission(..) => true,
+                PlanNode::PostSubmit(..) => true,
                 _ => false,
-            })
+            }
+        }
+
+        let total_submits = graph
+            .dag
+            .nodes_iter()
+            .filter(|n| node_can_submit(n))
             .count();
+
         let mut visited_submits = 0;
 
-        for item in topo.into_iter().rev() {
-            // :TakeShouldMove
-            // @Cleanup: Those replaces should not be necessary
-            match item {
-                GraphItem::Node(node) => {
-                    match std::mem::replace(nodes.take(node).unwrap(), PlanNode::Root) {
-                        PlanNode::Image(..) => {}
-                        PlanNode::Buffer(..) => {}
-                        PlanNode::ClearImage(..) => {}
-                        PlanNode::ClearBuffer(..) => {}
-                        PlanNode::LoadImage(..) => {}
-                        PlanNode::StoreImage(..) => {}
-                        PlanNode::WaitSemaphore(index, stages) => {
-                            flush_before_next = true;
-                            // TODO: manage semaphore lifetimes
-                            let semaphore = self.factory.create_semaphore().unwrap();
-                            indexed_waits.insert(index, wait_semaphores.len());
-                            wait_semaphores.push(semaphore);
-                            wait_stages.push(stages);
-                        }
-                        PlanNode::RenderPass(pass) => {
-                            visited_submits += 1;
-                            let ctx = ExecContext {
-                                factory: self.factory,
-                                families: self.families,
-                                images: HashMap::new(),  // TODO
-                                buffers: HashMap::new(), // TODO
-                                frames: self.frames,
-                                resources: self.resources,
-                                submits: &mut submits,
-                                indexed_waits: &indexed_waits,
-                                wait_semaphores: &wait_semaphores,
-                            };
+        for node in topo.into_iter().rev() {
+            let can_submit = node_can_submit(&graph.dag[node]);
 
-                            pass.run(ctx);
-                        }
-                        PlanNode::Submission(node_id, closure) => {
-                            visited_submits += 1;
-                            let ctx = ExecContext {
-                                factory: self.factory,
-                                families: self.families,
-                                images: HashMap::new(),  // TODO
-                                buffers: HashMap::new(), // TODO
-                                frames: self.frames,
-                                resources: self.resources,
-                                submits: &mut submits,
-                                indexed_waits: &indexed_waits,
-                                wait_semaphores: &wait_semaphores,
-                            };
-                            closure(ctx).map_err(|e| GraphRunError::NodeExecution(node_id, e))?
-                        }
-                        PlanNode::PostSubmit(node_id, closure) => {
-                            let last_submit = visited_submits == total_submits;
-                            if flush_before_next || last_submit {
-                                flush_before_next = false;
-                                // TODO: split submits by family type. Now just assume everything is graphics
-                                // let queue = self
-                                //     .families
-                                //     .queue_mut(self.resources.queue(FamilyType::Graphics));
-                                // TODO: put fence if last submission
-                                // queue.submit(submits.drain(..), None);
-                                // queue.submit(
-                                //     Some(
-                                //         Submission::new()
-                                //             .submits(submits.drain(..))
-                                //             // .wait()
-                                //             .signal(wait_semaphores.drain(..)),
-                                //     ),
-                                //     fence,
-                                // );
-                            }
+            // TODO: Actually get family type of node.
+            let family_type = FamilyType::Graphics;
 
-                            let ctx = ExecContext {
-                                factory: self.factory,
-                                families: self.families,
-                                images: HashMap::new(),  // TODO
-                                buffers: HashMap::new(), // TODO
-                                frames: self.frames,
-                                resources: self.resources,
-                                submits: &mut submits,
-                                indexed_waits: &indexed_waits,
-                                wait_semaphores: &wait_semaphores,
-                            };
-                            closure(ctx).map_err(|e| GraphRunError::NodeExecution(node_id, e))?
+            if can_submit {
+                visited_submits += 1;
+                // before waiting, try flushing if necessary
+                self.flush_all(visited_submits == total_submits);
+
+                for (child_edge, child_node) in node.children().iter(&graph.dag) {
+                    match (&graph.dag[child_edge], &graph.dag[child_node]) {
+                        (PlanEdge::Origin, PlanNode::Semaphore(wait_id)) => {
+                            let semaphore = self.resources.get_semaphore_to_signal(self.factory);
+                            let index = self.semaphores.insert_indexed(semaphore, *wait_id);
+                            self.add_signal(family_type, index);
                         }
-                        PlanNode::ResolveImage => {}
-                        PlanNode::ImageVersion => {}
-                        PlanNode::BufferVersion => {}
-                        PlanNode::UndefinedImage => {}
-                        PlanNode::UndefinedBuffer => {}
-                        PlanNode::Root => {}
-                        n @ PlanNode::RenderSubpass(..) => {
-                            panic!("Unexpected unprocessed node {:?}", n)
-                        }
+                        _ => {}
                     }
                 }
-                GraphItem::Edge(edge) => {
-                    match std::mem::replace(edges.take(edge).unwrap(), PlanEdge::Effect) {
-                        PlanEdge::Effect | PlanEdge::Version | PlanEdge::Origin => {}
-                        e @ PlanEdge::AttachmentRef(..)
-                        | e @ PlanEdge::PassAttachment(..)
-                        | e @ PlanEdge::BufferAccess(..)
-                        | e @ PlanEdge::ImageAccess(..) => {
-                            panic!("Unexpected unprocessed edge {:?}", e)
+
+                for (parent_edge, parent_node) in node.parents().iter(&graph.dag) {
+                    match (&graph.dag[parent_edge], &graph.dag[parent_node]) {
+                        (PlanEdge::Wait(stages), PlanNode::Semaphore(wait_id)) => {
+                            let semaphore_index = self
+                                .semaphores
+                                .get_index(*wait_id)
+                                .expect("Trying to wait on a non-signalled semaphore");
+                            self.add_wait(family_type, semaphore_index, *stages);
                         }
+                        _ => {}
+                    }
+                }
+
+                match std::mem::replace(&mut graph.dag[node], PlanNode::Evaluated) {
+                    PlanNode::RenderPass(pass) => {
+                        pass.run(&mut self);
+                    }
+                    PlanNode::Submission(node_id, closure) => {
+                        closure(&mut self).map_err(|e| GraphRunError::NodeExecution(node_id, e))?
+                    }
+                    PlanNode::PostSubmit(node_id, closure) => {
+                        closure(&mut self).map_err(|e| GraphRunError::NodeExecution(node_id, e))?
+                    }
+                    _ => unreachable!(),
+                }
+            } else {
+                match &graph.dag[node] {
+                    PlanNode::Image(image_node) => {
+                        // collect usages
+                        // TODO: support transient images
+
+                        let mut current = node.child_origin(&graph.dag).unwrap();
+                        let mut access = rendy_core::hal::image::Usage::empty();
+                        while let Some(version) = current.child_version(&graph.dag) {
+                            current = version;
+
+                            for (usage_edge, _) in version.children().iter(&graph.dag) {
+                                match &graph.dag[usage_edge] {
+                                    PlanEdge::ImageAccess(node, _) => access |= node.usage(),
+                                    PlanEdge::PassAttachment(attachment) => {
+                                        access |= attachment.usage
+                                    }
+                                    PlanEdge::Effect => {}
+                                    PlanEdge::Version => {}
+                                    e => panic!("Unsupported image child edge {:?}", e),
+                                }
+                            }
+                        }
+
+                        let image = self
+                            .factory
+                            .create_image(
+                                rendy_resource::ImageInfo {
+                                    kind: image_node.kind,
+                                    levels: image_node.levels,
+                                    format: image_node.format,
+                                    tiling: rendy_core::hal::image::Tiling::Optimal,
+                                    view_caps: rendy_core::hal::image::ViewCapabilities::empty(),
+                                    usage: access,
+                                },
+                                rendy_memory::Data,
+                            )
+                            .unwrap();
+                        self.images.insert(image_node.id, (image.into(), None));
+                    }
+                    PlanNode::Buffer(..) => {
+                        // TODO
+                        unimplemented!()
+                    }
+                    PlanNode::ClearImage(..) => {
+                        // TODO
+                        unimplemented!()
+                    }
+                    PlanNode::ClearBuffer(..) => {
+                        // TODO
+                        unimplemented!()
+                    }
+                    PlanNode::LoadImage(..) => {
+                        // TODO
+                        unimplemented!()
+                    }
+                    PlanNode::StoreImage(..) => {
+                        // TODO
+                        unimplemented!()
+                    }
+                    PlanNode::ResolveImage => {
+                        // TODO
+                        unimplemented!()
+                    }
+                    PlanNode::BufferVersion
+                    | PlanNode::ImageVersion
+                    | PlanNode::UndefinedImage
+                    | PlanNode::UndefinedBuffer
+                    | PlanNode::Semaphore(..)
+                    | PlanNode::Root => {}
+                    PlanNode::Evaluated
+                    | PlanNode::RenderPass(..)
+                    | PlanNode::Submission(..)
+                    | PlanNode::PostSubmit(..) => unreachable!(),
+                    n @ PlanNode::RenderSubpass(..) => {
+                        panic!("Unexpected unprocessed node {:?}", n)
                     }
                 }
             }
         }
 
+        self.semaphores.recycle(self.resources);
+        self.images.clear();
+        self.buffers.clear();
         Ok(())
     }
+
+    fn flush<'a>(&mut self, family_type: FamilyType, use_fence: bool, force_flush: bool) {
+        if let Some(family_id) = self.resources.family_id(family_type) {
+            self.flush_family(family_id, use_fence, force_flush);
+        }
+    }
+
+    fn flush_family(&mut self, family_id: FamilyId, use_fence: bool, force_flush: bool) {
+        if let Some(submit_data) = self.submit_data.get_mut(&family_id) {
+            if (force_flush && submit_data.submits.len() > 0)
+                || submit_data.signals.len() > 0
+                || use_fence
+            {
+                let semaphores = &self.semaphores;
+                self.resources.flush(
+                    self.factory,
+                    self.families,
+                    family_id,
+                    submit_data.submits.drain(..),
+                    submit_data
+                        .waits
+                        .drain(..)
+                        .map(|(i, s)| (semaphores.get_by_index(i), s)),
+                    submit_data
+                        .signals
+                        .drain(..)
+                        .map(|i| semaphores.get_by_index(i)),
+                    use_fence,
+                )
+            }
+        }
+    }
+
+    fn add_signal(&mut self, family_type: FamilyType, semaphore_index: usize) {
+        let family_id = self.resources.family_id(family_type);
+        if let Some(submit_data) = family_id.and_then(|id| self.submit_data.get_mut(&id)) {
+            submit_data.signals.push(semaphore_index);
+        } else {
+            panic!(
+                "Trying to add signal on nonexistant family type {:?}",
+                family_type
+            );
+        }
+    }
+
+    fn add_wait(
+        &mut self,
+        family_type: FamilyType,
+        semaphore_index: usize,
+        stages: rendy_core::hal::pso::PipelineStage,
+    ) {
+        let family_id = self.resources.family_id(family_type);
+        if let Some(submit_data) = family_id.and_then(|id| self.submit_data.get_mut(&id)) {
+            submit_data.waits.push((semaphore_index, stages));
+        } else {
+            panic!(
+                "Trying to add wait for nonexistant family type {:?}",
+                family_type
+            );
+        }
+    }
+
+    pub fn queue_id(&self, family_type: FamilyType) -> QueueId {
+        self.resources.queue(family_type)
+    }
+
+    pub fn request_render_pass(&mut self, pass_info: RenderPassInfo) -> &B::RenderPass {
+        self.resources.request_render_pass(self.factory, pass_info)
+    }
+
+    pub fn submit(
+        &mut self,
+        family_type: FamilyType,
+        submits: impl IntoIterator<Item = impl Into<EitherSubmit<'run, B>>>,
+    ) {
+        if let Some(family_id) = self.resources.family_id(family_type) {
+            self.submit_data
+                .entry(family_id)
+                .or_default()
+                .submits
+                .extend(submits.into_iter().map(Into::into))
+        }
+    }
+
+    pub fn get_image(&self, token: ImageToken) -> &Handle<Image<B>> {
+        self.images
+            .get(&token.id())
+            .map(|i| &i.0)
+            .expect("Somehow got a token to unscheduled image")
+    }
+
+    pub fn get_buffer(&self, token: BufferToken) -> &Handle<Buffer<B>> {
+        self.buffers
+            .get(&token.id())
+            .expect("Somehow got a token to unscheduled buffer")
+    }
+
+    pub fn frames(&self) -> &Frames<B> {
+        &self.resources.frames
+    }
 }
+
 /// Error that happen during rendering graph run.
 #[derive(Debug, Clone, Copy)]
 pub enum GraphRunError {
@@ -1828,7 +2196,7 @@ mod test {
 
     impl<B: Backend, T: ?Sized> NodeBuilder<B, T> for TestPass {
         type Node = Self;
-        type Family = crate::command::Graphics;
+        type Family = Graphics;
         fn build(
             self: Box<Self>,
             _: &mut Factory<B>,
@@ -1881,7 +2249,7 @@ mod test {
 
     impl<B: Backend, T: ?Sized> NodeBuilder<B, T> for TestPass2 {
         type Node = Self;
-        type Family = crate::command::Graphics;
+        type Family = Graphics;
         fn build(
             self: Box<Self>,
             _: &mut Factory<B>,
@@ -1930,7 +2298,7 @@ mod test {
 
     impl<B: Backend, T: ?Sized> NodeBuilder<B, T> for TestCompute1 {
         type Node = Self;
-        type Family = crate::command::Graphics;
+        type Family = Graphics;
         fn build(
             self: Box<Self>,
             _: &mut Factory<B>,
@@ -1990,7 +2358,7 @@ mod test {
 
     impl<B: Backend, T: ?Sized> NodeBuilder<B, T> for TestPass3 {
         type Node = Self;
-        type Family = crate::command::Graphics;
+        type Family = Graphics;
         fn build(
             self: Box<Self>,
             _: &mut Factory<B>,
@@ -2028,7 +2396,7 @@ mod test {
 
     impl<B: Backend, T: ?Sized> NodeBuilder<B, T> for TestOutput {
         type Node = Self;
-        type Family = crate::command::Graphics;
+        type Family = Graphics;
         fn build(
             self: Box<Self>,
             _: &mut Factory<B>,
@@ -2075,9 +2443,9 @@ mod test {
                 let mut builder = GraphBuilder::new();
 
                 let depth = builder.add(ImageInfo {
-                    kind: rendy_core::hal::image::Kind::D2(1, 1, 1, 1),
+                    kind: rendy_core::hal::image::Kind::D2(1024, 1024, 1, 1),
                     levels: 1,
-                    format: rendy_core::hal::format::Format::R32Sfloat,
+                    format: rendy_core::hal::format::Format::D32Sfloat,
                     load: ImageLoad::Clear(rendy_core::hal::command::ClearValue {
                         depth_stencil: rendy_core::hal::command::ClearDepthStencil {
                             depth: 0.0,
@@ -2086,13 +2454,13 @@ mod test {
                     }),
                 });
                 let depth2 = builder.add(ImageInfo {
-                    kind: rendy_core::hal::image::Kind::D2(1, 1, 1, 1),
+                    kind: rendy_core::hal::image::Kind::D2(1024, 1024, 1, 1),
                     levels: 1,
-                    format: rendy_core::hal::format::Format::R32Sfloat,
+                    format: rendy_core::hal::format::Format::D32Sfloat,
                     load: ImageLoad::DontCare,
                 });
                 let color2 = builder.add(ImageInfo {
-                    kind: rendy_core::hal::image::Kind::D2(1, 1, 1, 1),
+                    kind: rendy_core::hal::image::Kind::D2(1024, 1024, 1, 1),
                     levels: 1,
                     format: rendy_core::hal::format::Format::Rgba8Unorm,
                     load: ImageLoad::DontCare,
@@ -2101,10 +2469,10 @@ mod test {
                 builder.add(TestPass2::new(Some(color2), None, None));
                 builder.add(TestPass2::new(Some(color), Some(color2), None));
                 builder.add(TestPass::new(color, Some(depth)));
-                let buf1 = builder.add(TestCompute1::new(Some(color)));
+                // let buf1 = builder.add(TestCompute1::new(Some(color)));
                 builder.add(TestPass::new(color2, Some(depth2)));
-                builder.add(TestPass3::new(color, buf1, false));
-                builder.add(TestPass3::new(color, buf1, true));
+                // builder.add(TestPass3::new(color, buf1, false));
+                // builder.add(TestPass3::new(color, buf1, true));
                 builder.add(TestPass2::new(Some(color2), Some(color), None));
                 builder.add(TestPass2::new(Some(color), Some(color2), None));
                 builder.add(TestPass2::new(Some(color), Some(color2), Some(depth2)));
@@ -2119,7 +2487,7 @@ mod test {
                 unsafe {
                     graph.alloc.reset();
                 }
-                let mut run_ctx = ConstructContext::new(&factory, &mut families, &mut graph.frames, &mut graph.resources, &graph.alloc);
+                let mut run_ctx = ConstructContext::new(&factory, &mut families, &mut graph.resources, &graph.alloc);
                 graph
                     .nodes
                     .run_construction_phase(&mut run_ctx, &())
@@ -2132,7 +2500,8 @@ mod test {
                 visualize_graph(&mut file, &run_ctx.graph.dag, "opti");
                 run_ctx.run_execution_phase().unwrap();
 
-            }
+                graph.dispose(&mut factory, &());
+        }
         );
     }
 }

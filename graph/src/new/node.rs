@@ -6,7 +6,6 @@ use {
     crate::{
         command::{Capability, Families, Family, FamilyId},
         factory::{Factory, UploadError},
-        resource::{Buffer, Handle, Image},
         wsi::SwapchainError,
     },
     rendy_core::hal::{queue::QueueFamilyId, Backend},
@@ -349,11 +348,9 @@ impl<B: Backend, T: ?Sized, N: NodeBuilder<B, T>> DynNodeBuilder<B, T> for N {
 }
 
 pub type ExecResult = Result<(), NodeExecutionError>;
-pub type PassFn<'n, B> = Box<dyn for<'a> FnOnce(ExecPassContext<'a, B>) -> ExecResult + 'n>;
-pub type SubmissionFn<'run, B> =
-    Box<dyn for<'a> FnOnce(ExecContext<'a, 'run, B>) -> ExecResult + 'run>;
-pub type PostSubmitFn<'run, B> =
-    Box<dyn for<'a> FnOnce(ExecContext<'a, 'run, B>) -> ExecResult + 'run>;
+pub type PassFn<'run, B> = Box<dyn for<'a> FnOnce(ExecPassContext<'a, B>) -> ExecResult + 'run>;
+pub type SubmissionFn<'run, B> = Box<dyn FnOnce(&mut ExecContext<'run, B>) -> ExecResult + 'run>;
+pub type PostSubmitFn<'run, B> = Box<dyn FnOnce(&mut ExecContext<'run, B>) -> ExecResult + 'run>;
 
 #[derive(Debug, Clone, Copy)]
 pub enum ExecutionPhase {
@@ -408,28 +405,28 @@ impl<'run, B: Backend> NodeExecution<'run, B> {
 
     pub fn submission<F>(general_closure: F) -> Self
     where
-        F: for<'a> FnOnce(ExecContext<'a, 'run, B>) -> ExecResult + 'run,
+        F: FnOnce(&mut ExecContext<'run, B>) -> ExecResult + 'run,
     {
         Self::Submission(ExecutionPhase::Default, Box::new(general_closure))
     }
 
     pub fn output_submission<F>(general_closure: F) -> Self
     where
-        F: for<'a> FnOnce(ExecContext<'a, 'run, B>) -> ExecResult + 'run,
+        F: FnOnce(&mut ExecContext<'run, B>) -> ExecResult + 'run,
     {
         Self::Submission(ExecutionPhase::Output, Box::new(general_closure))
     }
 
     pub fn post_submit<F>(general_closure: F) -> Self
     where
-        F: for<'a> FnOnce(ExecContext<'a, 'run, B>) -> ExecResult + 'run,
+        F: FnOnce(&mut ExecContext<'run, B>) -> ExecResult + 'run,
     {
         Self::PostSubmit(ExecutionPhase::Default, Box::new(general_closure))
     }
 
     pub fn output_post_submit<F>(general_closure: F) -> Self
     where
-        F: for<'a> FnOnce(ExecContext<'a, 'run, B>) -> ExecResult + 'run,
+        F: FnOnce(&mut ExecContext<'run, B>) -> ExecResult + 'run,
     {
         Self::PostSubmit(ExecutionPhase::Output, Box::new(general_closure))
     }
@@ -465,147 +462,96 @@ pub struct BufferBarrier {
     pub families: Option<std::ops::Range<QueueFamilyId>>,
 }
 
-/// Image shared between nodes.
-#[derive(Clone, Debug)]
-pub struct NodeImage<B: Backend> {
-    /// The actual image object.
-    pub image: Handle<Image<B>>,
+// /// Convert graph barriers into gfx barriers.
+// pub fn gfx_acquire_barriers<'a, B: Backend>(
+//     buffers: impl IntoIterator<Item = &'a NodeBuffer<B>>,
+//     images: impl IntoIterator<Item = &'a NodeImage<B>>,
+// ) -> (
+//     std::ops::Range<rendy_core::hal::pso::PipelineStage>,
+//     Vec<rendy_core::hal::memory::Barrier<'a, B>>,
+// ) {
+//     let mut bstart = rendy_core::hal::pso::PipelineStage::empty();
+//     let mut bend = rendy_core::hal::pso::PipelineStage::empty();
 
-    /// Region of the image that is the transient resource.
-    pub range: rendy_core::hal::image::SubresourceRange,
+//     let mut istart = rendy_core::hal::pso::PipelineStage::empty();
+//     let mut iend = rendy_core::hal::pso::PipelineStage::empty();
 
-    /// Image state for node.
-    pub layout: rendy_core::hal::image::Layout,
+//     let barriers: Vec<rendy_core::hal::memory::Barrier<'_, B>> = buffers
+//         .into_iter()
+//         .filter_map(|buffer| {
+//             buffer.acquire.as_ref().map(|acquire| {
+//                 bstart |= acquire.stages.start;
+//                 bend |= acquire.stages.end;
 
-    /// Acquire barrier.
-    /// Node implementation must insert it before first command that uses the image.
-    /// Barrier must be inserted even if this node doesn't use the image.
-    pub acquire: Option<ImageBarrier>,
+//                 rendy_core::hal::memory::Barrier::Buffer {
+//                     states: acquire.states.clone(),
+//                     families: acquire.families.clone(),
+//                     target: buffer.buffer.raw(),
+//                     range: Some(buffer.range.start)..Some(buffer.range.end),
+//                 }
+//             })
+//         })
+//         .chain(images.into_iter().filter_map(|image| {
+//             image.acquire.as_ref().map(|acquire| {
+//                 istart |= acquire.stages.start;
+//                 iend |= acquire.stages.end;
 
-    /// Release barrier.
-    /// Node implementation must insert it after last command that uses the image.
-    /// Barrier must be inserted even if this node doesn't use the image.
-    pub release: Option<ImageBarrier>,
+//                 rendy_core::hal::memory::Barrier::Image {
+//                     states: acquire.states.clone(),
+//                     families: acquire.families.clone(),
+//                     target: image.image.raw(),
+//                     range: image.range.clone(),
+//                 }
+//             })
+//         }))
+//         .collect();
 
-    /// Specify that node should clear image to this value.
-    pub clear: Option<rendy_core::hal::command::ClearValue>,
-}
+//     (bstart | istart..bend | iend, barriers)
+// }
 
-/// Buffer shared between nodes.
-///
-/// If Node doesn't actually use the buffer it can merge acquire and release barriers into one.
-#[derive(Clone, Debug)]
-pub struct NodeBuffer<B: Backend> {
-    /// The actual buffer object.
-    pub buffer: Handle<Buffer<B>>,
+// /// Convert graph barriers into gfx barriers.
+// pub fn gfx_release_barriers<'a, B: Backend>(
+//     buffers: impl IntoIterator<Item = &'a NodeBuffer<B>>,
+//     images: impl IntoIterator<Item = &'a NodeImage<B>>,
+// ) -> (
+//     std::ops::Range<rendy_core::hal::pso::PipelineStage>,
+//     Vec<rendy_core::hal::memory::Barrier<'a, B>>,
+// ) {
+//     let mut bstart = rendy_core::hal::pso::PipelineStage::empty();
+//     let mut bend = rendy_core::hal::pso::PipelineStage::empty();
 
-    /// Region of the buffer that is the transient resource.
-    pub range: std::ops::Range<u64>,
+//     let mut istart = rendy_core::hal::pso::PipelineStage::empty();
+//     let mut iend = rendy_core::hal::pso::PipelineStage::empty();
 
-    /// Acquire barrier.
-    /// Node implementation must insert it before first command that uses the buffer.
-    /// Barrier must be inserted even if this node doesn't use the buffer.
-    pub acquire: Option<BufferBarrier>,
+//     let barriers: Vec<rendy_core::hal::memory::Barrier<'_, B>> = buffers
+//         .into_iter()
+//         .filter_map(|buffer| {
+//             buffer.release.as_ref().map(|release| {
+//                 bstart |= release.stages.start;
+//                 bend |= release.stages.end;
 
-    /// Release barrier.
-    /// Node implementation must insert it after last command that uses the buffer.
-    /// Barrier must be inserted even if this node doesn't use the buffer.
-    pub release: Option<BufferBarrier>,
+//                 rendy_core::hal::memory::Barrier::Buffer {
+//                     states: release.states.clone(),
+//                     families: release.families.clone(),
+//                     target: buffer.buffer.raw(),
+//                     range: Some(buffer.range.start)..Some(buffer.range.end),
+//                 }
+//             })
+//         })
+//         .chain(images.into_iter().filter_map(|image| {
+//             image.release.as_ref().map(|release| {
+//                 istart |= release.stages.start;
+//                 iend |= release.stages.end;
 
-    /// Specify that node should clear buffer to this value.
-    pub clear: Option<u32>,
-}
+//                 rendy_core::hal::memory::Barrier::Image {
+//                     states: release.states.clone(),
+//                     families: release.families.clone(),
+//                     target: image.image.raw(),
+//                     range: image.range.clone(),
+//                 }
+//             })
+//         }))
+//         .collect();
 
-/// Convert graph barriers into gfx barriers.
-pub fn gfx_acquire_barriers<'a, B: Backend>(
-    buffers: impl IntoIterator<Item = &'a NodeBuffer<B>>,
-    images: impl IntoIterator<Item = &'a NodeImage<B>>,
-) -> (
-    std::ops::Range<rendy_core::hal::pso::PipelineStage>,
-    Vec<rendy_core::hal::memory::Barrier<'a, B>>,
-) {
-    let mut bstart = rendy_core::hal::pso::PipelineStage::empty();
-    let mut bend = rendy_core::hal::pso::PipelineStage::empty();
-
-    let mut istart = rendy_core::hal::pso::PipelineStage::empty();
-    let mut iend = rendy_core::hal::pso::PipelineStage::empty();
-
-    let barriers: Vec<rendy_core::hal::memory::Barrier<'_, B>> = buffers
-        .into_iter()
-        .filter_map(|buffer| {
-            buffer.acquire.as_ref().map(|acquire| {
-                bstart |= acquire.stages.start;
-                bend |= acquire.stages.end;
-
-                rendy_core::hal::memory::Barrier::Buffer {
-                    states: acquire.states.clone(),
-                    families: acquire.families.clone(),
-                    target: buffer.buffer.raw(),
-                    range: Some(buffer.range.start)..Some(buffer.range.end),
-                }
-            })
-        })
-        .chain(images.into_iter().filter_map(|image| {
-            image.acquire.as_ref().map(|acquire| {
-                istart |= acquire.stages.start;
-                iend |= acquire.stages.end;
-
-                rendy_core::hal::memory::Barrier::Image {
-                    states: acquire.states.clone(),
-                    families: acquire.families.clone(),
-                    target: image.image.raw(),
-                    range: image.range.clone(),
-                }
-            })
-        }))
-        .collect();
-
-    (bstart | istart..bend | iend, barriers)
-}
-
-/// Convert graph barriers into gfx barriers.
-pub fn gfx_release_barriers<'a, B: Backend>(
-    buffers: impl IntoIterator<Item = &'a NodeBuffer<B>>,
-    images: impl IntoIterator<Item = &'a NodeImage<B>>,
-) -> (
-    std::ops::Range<rendy_core::hal::pso::PipelineStage>,
-    Vec<rendy_core::hal::memory::Barrier<'a, B>>,
-) {
-    let mut bstart = rendy_core::hal::pso::PipelineStage::empty();
-    let mut bend = rendy_core::hal::pso::PipelineStage::empty();
-
-    let mut istart = rendy_core::hal::pso::PipelineStage::empty();
-    let mut iend = rendy_core::hal::pso::PipelineStage::empty();
-
-    let barriers: Vec<rendy_core::hal::memory::Barrier<'_, B>> = buffers
-        .into_iter()
-        .filter_map(|buffer| {
-            buffer.release.as_ref().map(|release| {
-                bstart |= release.stages.start;
-                bend |= release.stages.end;
-
-                rendy_core::hal::memory::Barrier::Buffer {
-                    states: release.states.clone(),
-                    families: release.families.clone(),
-                    target: buffer.buffer.raw(),
-                    range: Some(buffer.range.start)..Some(buffer.range.end),
-                }
-            })
-        })
-        .chain(images.into_iter().filter_map(|image| {
-            image.release.as_ref().map(|release| {
-                istart |= release.stages.start;
-                iend |= release.stages.end;
-
-                rendy_core::hal::memory::Barrier::Image {
-                    states: release.states.clone(),
-                    families: release.families.clone(),
-                    target: image.image.raw(),
-                    range: image.range.clone(),
-                }
-            })
-        }))
-        .collect();
-
-    (bstart | istart..bend | iend, barriers)
-}
+//     (bstart | istart..bend | iend, barriers)
+// }

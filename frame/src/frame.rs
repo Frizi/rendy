@@ -159,7 +159,7 @@ where
     }
 
     /// Dispose of the `Frames`
-    pub fn dispose(mut self, factory: &mut Factory<B>) {
+    pub fn dispose(mut self, factory: &Factory<B>) {
         let ready = factory.wait_for_fences(
             self.pending.iter_mut().flatten(),
             rendy_core::hal::device::WaitFor::All,

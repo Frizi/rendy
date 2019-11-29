@@ -129,8 +129,13 @@ where
         //     });
         // }
 
+        // @Robustness
+        // The image providing code should actually be a execution time thing.
+        // Only then we actually know how the image is going to be used, and also
+        // the semaphore thing wouldn't be so awkward.
+
         let extent = target.extent();
-        let semaphore = ctx.factory().create_semaphore().unwrap();
+        let semaphore = ctx.create_semaphore();
         let next = unsafe { target.next_image(&semaphore) };
 
         let (output, index, wait) = match &next {
@@ -151,13 +156,13 @@ where
 
                 let output = ctx.provide_image(image_info, image, Some(semaphore));
                 ctx.use_image(output, ImageUsage::Present)?;
-                let wait = ctx.wait_semaphore(ImageUsage::Present.stage());
+                let wait = ctx.wait_semaphore(output, ImageUsage::Present.stage());
                 (output, index, wait)
             }
             Err(err) => {
                 log::debug!("Swapchain acquisition error: {:#?}", err);
                 unsafe {
-                    ctx.factory().destroy_semaphore(semaphore);
+                    ctx.recycle_semaphores(Some(semaphore));
                 }
                 // just create a dummy image and do nothing
                 let image_info = ImageInfo {
@@ -176,13 +181,14 @@ where
 
         Ok((
             output,
-            NodeExecution::output_post_submit(move |mut ctx| {
+            NodeExecution::output_post_submit(move |ctx| {
                 use hal::queue::CommandQueue;
                 let target = self.get_target.target(aux);
                 let swapchain = target.swapchain();
 
-                let semaphore = ctx.get_semaphore(wait);
-                let queue = ctx.queue_mut(FamilyType::Graphics).raw();
+                let semaphore = &ctx.semaphores[wait];
+                let queue_id = ctx.queue_id(FamilyType::Graphics);
+                let queue = ctx.families.queue_mut(queue_id).raw();
 
                 if let Err(err) =
                     unsafe { queue.present(Some((swapchain, index)), Some(semaphore)) }
@@ -196,5 +202,5 @@ where
         ))
     }
 
-    unsafe fn dispose(self: Box<Self>, factory: &mut Factory<B>, _aux: &T) {}
+    // unsafe fn dispose(self: Box<Self>, _factory: &mut Factory<B>, _aux: &T) {}
 }

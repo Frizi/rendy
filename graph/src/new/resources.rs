@@ -154,6 +154,42 @@ impl NodeImageAccess {
         }
         acc.unwrap_or(Layout::General)
     }
+
+    pub fn usage(&self) -> rendy_core::hal::image::Usage {
+        let mut usage = rendy_core::hal::image::Usage::empty();
+        if self.contains(Self::INPUT_ATTACHMENT_READ) {
+            // TODO: add support for TRANSIENT_ATTACHMENT
+            usage |= rendy_core::hal::image::Usage::INPUT_ATTACHMENT;
+        }
+        if self.contains(Self::SAMPLED_IMAGE_READ) {
+            usage |= rendy_core::hal::image::Usage::SAMPLED;
+        }
+        if self.contains(Self::STORAGE_IMAGE_READ) {
+            usage |= rendy_core::hal::image::Usage::STORAGE;
+        }
+        if self.contains(Self::STORAGE_IMAGE_WRITE) {
+            usage |= rendy_core::hal::image::Usage::STORAGE;
+        }
+        if self.contains(Self::COLOR_ATTACHMENT_READ) {
+            usage |= rendy_core::hal::image::Usage::COLOR_ATTACHMENT;
+        }
+        if self.contains(Self::COLOR_ATTACHMENT_WRITE) {
+            usage |= rendy_core::hal::image::Usage::COLOR_ATTACHMENT;
+        }
+        if self.contains(Self::DEPTH_STENCIL_ATTACHMENT_READ) {
+            usage |= rendy_core::hal::image::Usage::DEPTH_STENCIL_ATTACHMENT;
+        }
+        if self.contains(Self::DEPTH_STENCIL_ATTACHMENT_WRITE) {
+            usage |= rendy_core::hal::image::Usage::DEPTH_STENCIL_ATTACHMENT;
+        }
+        if self.contains(Self::TRANSFER_READ) {
+            usage |= rendy_core::hal::image::Usage::TRANSFER_SRC;
+        }
+        if self.contains(Self::TRANSFER_WRITE) {
+            usage |= rendy_core::hal::image::Usage::TRANSFER_DST;
+        }
+        usage
+    }
 }
 
 fn common_layout(
@@ -217,6 +253,21 @@ pub enum ResourceId {
     Wait(WaitId),
 }
 
+pub trait WaitableResource {
+    fn id(self) -> ResourceId;
+}
+
+impl WaitableResource for ImageId {
+    fn id(self) -> ResourceId {
+        ResourceId::Image(self)
+    }
+}
+impl WaitableResource for BufferId {
+    fn id(self) -> ResourceId {
+        ResourceId::Buffer(self)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttachmentAccess {
     ReadOnly,
@@ -244,7 +295,7 @@ pub enum ResourceUsage {
     ColorAttachment(ImageId, usize),
     InputAttachment(ImageId, usize),
     DepthAttachment(ImageId, AttachmentAccess),
-    WaitSemaphore(WaitId, PipelineStage),
+    Semaphore(WaitId, ResourceId, PipelineStage),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -263,7 +314,7 @@ impl ResourceUsage {
             Self::DepthAttachment(a, _) => Some(*a),
             Self::Buffer(..) => None,
             Self::Virtual(..) => None,
-            Self::WaitSemaphore(..) => None,
+            Self::Semaphore(..) => None,
         }
     }
 

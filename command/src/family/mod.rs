@@ -16,13 +16,13 @@ use {
 pub use self::{queue::*, submission::*};
 
 /// Family id.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FamilyId {
+    /// Device id.
+    pub device: DeviceId,
     /// Family id within device.
     pub index: usize,
 
-    /// Device id.
-    pub device: DeviceId,
 }
 
 impl From<FamilyId> for rendy_core::hal::queue::QueueFamilyId {

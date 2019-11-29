@@ -53,7 +53,7 @@ fn new_device_id(instance: InstanceId) -> DeviceId {
 }
 
 /// Id of the hal instance.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct InstanceId {
     /// Unique id.
     #[cfg(not(feature = "no-slow-safety-checks"))]
@@ -141,7 +141,7 @@ where
 }
 
 /// Id of the instance.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DeviceId {
     /// Unique id.
     #[cfg(not(feature = "no-slow-safety-checks"))]

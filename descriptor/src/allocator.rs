@@ -335,7 +335,7 @@ where
                 }
 
                 if let Some(last) = last {
-                    bucket.free(self.allocation.sets.drain(0..), last);
+                    bucket.free(self.allocation.sets.drain(..), last);
                 }
 
                 Err(err)
