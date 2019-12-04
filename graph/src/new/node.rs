@@ -284,6 +284,18 @@ impl From<rendy_core::hal::device::OutOfMemory> for NodeBuildError {
     }
 }
 
+impl From<rendy_core::hal::pso::CreationError> for NodeBuildError {
+    fn from(err: rendy_core::hal::pso::CreationError) -> Self {
+        Self::Pipeline(err)
+    }
+}
+
+impl From<rendy_core::hal::image::ViewError> for NodeBuildError {
+    fn from(err: rendy_core::hal::image::ViewError) -> Self {
+        Self::View(err)
+    }
+}
+
 pub trait NodeBuilder<B: Backend, T: ?Sized>: std::fmt::Debug + Sized {
     type Node: Node<B, T> + 'static;
     type Family: FamilySelector<B, T, Self>;
@@ -462,6 +474,7 @@ pub struct BufferBarrier {
     pub families: Option<std::ops::Range<QueueFamilyId>>,
 }
 
+// TODO: remove/replace
 // /// Convert graph barriers into gfx barriers.
 // pub fn gfx_acquire_barriers<'a, B: Backend>(
 //     buffers: impl IntoIterator<Item = &'a NodeBuffer<B>>,

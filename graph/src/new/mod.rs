@@ -3,7 +3,7 @@
 
 //! A new implementation of rendering graph
 
-#[cfg(test)]
+// #[cfg(test)]
 #[macro_use]
 mod test;
 
@@ -16,8 +16,13 @@ mod resources;
 mod track;
 mod walker;
 
-pub use graph::{Graph, GraphBuildError, GraphBuilder, GraphRunError};
+pub use graph::{
+    ExecPassContext, FamilyType, Graph, GraphBuildError, GraphBuilder, GraphRunError, NodeCtx,
+};
+pub use node::{ConstructResult, Node, NodeBuildError, NodeBuilder, NodeExecution, Parameter};
 pub use nodes::*;
+pub use resources::{BufferId, ImageId, RenderPassId, SubpassId, VirtualId, WaitId};
+pub use track::Track;
 
 // fn setup_graph(g: GraphBuilder) {
 //     let color = g.add(OutputToWindow::new());

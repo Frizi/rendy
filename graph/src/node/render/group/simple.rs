@@ -248,7 +248,7 @@ where
     ) -> Result<Box<dyn RenderGroup<B, T>>, rendy_core::hal::pso::CreationError> {
         log::trace!("Load shader sets for");
 
-        let mut shader_set = self.inner.load_shader_set(factory, aux);
+        let shader_set = self.inner.load_shader_set(factory, aux);
 
         let pipeline = self.inner.pipeline();
 
@@ -261,22 +261,28 @@ where
                     .create_descriptor_set_layout(set.bindings)
                     .map(Handle::from)
             })
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| {
-                shader_set.dispose(factory);
-                e
-            })?;
+            .collect::<Result<Vec<_>, _>>();
 
-        let pipeline_layout = unsafe {
+        let set_layouts = match set_layouts {
+            Ok(layouts) => layouts,
+            Err(e) => {
+                shader_set.dispose(factory);
+                return Err(e.into());
+            }
+        };
+
+        let pipeline_layout = match unsafe {
             factory.device().create_pipeline_layout(
                 set_layouts.iter().map(|l| l.raw()),
                 pipeline.layout.push_constants,
             )
-        }
-        .map_err(|e| {
-            shader_set.dispose(factory);
-            rendy_core::hal::pso::CreationError::OutOfMemory(e)
-        })?;
+        } {
+            Ok(l) => l,
+            Err(e) => {
+                shader_set.dispose(factory);
+                return Err(rendy_core::hal::pso::CreationError::OutOfMemory(e));
+            }
+        };
 
         assert_eq!(pipeline.colors.len(), self.inner.colors().len());
 
@@ -303,9 +309,9 @@ where
             Ok(s) => s,
         };
 
-        let graphics_pipeline = unsafe {
-            factory.device().create_graphics_pipelines(
-                Some(rendy_core::hal::pso::GraphicsPipelineDesc {
+        let graphics_pipeline = match unsafe {
+            factory.device().create_graphics_pipeline(
+                &rendy_core::hal::pso::GraphicsPipelineDesc {
                     shaders,
                     rasterizer: pipeline.rasterizer,
                     vertex_buffers,
@@ -330,23 +336,28 @@ where
                     subpass,
                     flags: rendy_core::hal::pso::PipelineCreationFlags::empty(),
                     parent: rendy_core::hal::pso::BasePipeline::None,
-                }),
+                },
                 None,
             )
-        }
-        .remove(0)
-        .map_err(|e| {
-            shader_set.dispose(factory);
-            e
-        })?;
-
-        let pipeline = self
-            .inner
-            .build(ctx, factory, queue, aux, buffers, images, &set_layouts)
-            .map_err(|e| {
+        } {
+            Ok(p) => p,
+            Err(e) => {
                 shader_set.dispose(factory);
-                e
-            })?;
+                return Err(e);
+            }
+        };
+
+        let pipeline =
+            match self
+                .inner
+                .build(ctx, factory, queue, aux, buffers, images, &set_layouts)
+            {
+                Ok(pipeline) => pipeline,
+                Err(e) => {
+                    shader_set.dispose(factory);
+                    return Err(e);
+                }
+            };
 
         shader_set.dispose(factory);
 

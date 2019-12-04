@@ -17,7 +17,7 @@ use {
             resources::{
                 AttachmentAccess, BufferId, BufferInfo, BufferUsage, ImageId, ImageInfo, ImageLoad,
                 ImageUsage, NodeBufferAccess, NodeImageAccess, NodeVirtualAccess, ResourceId,
-                ResourceUsage, VirtualId, WaitId, WaitableResource,
+                ResourceUsage, SubpassId, VirtualId, WaitId, WaitableResource,
             },
             walker::Topo,
         },
@@ -91,6 +91,7 @@ impl<B: Backend, T: ?Sized> GraphBuilder<B, T> {
         families: &mut Families<B>,
         aux: &T,
     ) -> Result<Graph<B, T>, GraphBuildError> {
+        // TODO: define a build context
         Ok(Graph {
             device: factory.device().id(),
             pipeline: Pipeline::new(),
@@ -331,6 +332,13 @@ impl<B: Backend> GraphResourcePool<B> {
             .unwrap_or_else(|| panic!("Family matching type {:?} not found", family_type))
     }
 
+    fn command_pool(
+        &mut self,
+        family_type: FamilyType,
+    ) -> &mut CommandPool<B, QueueType, IndividualReset> {
+        &mut self.family_data_mut_or_panic(family_type).pool
+    }
+
     fn allocate_buffers<L: Level>(
         &mut self,
         family_type: FamilyType,
@@ -552,17 +560,6 @@ impl<B: Backend, T: ?Sized> GraphNodes<B, T> {
     }
 }
 
-/// A context for rendergraph node construction phase. Contains all data that the node
-/// get access to and contains ready-made methods for common operations.
-#[derive(Debug)]
-pub(crate) struct NodeContext<'ctx, 'run, 'arena, B: Backend> {
-    id: NodeId,
-    seed: &'ctx mut NodeSeed,
-    run: &'ctx mut ConstructContext<'run, 'arena, B>,
-    next_image_id: usize,
-    next_buffer_id: usize,
-}
-
 /// A token that allows an image to be used in node execution
 #[derive(Debug, Clone, Copy)]
 pub struct ImageToken<'run>(ImageId, PhantomData<&'run ()>);
@@ -603,6 +600,17 @@ impl SemaphoreToken<'_> {
     pub(crate) fn id(&self) -> WaitId {
         self.0
     }
+}
+
+/// A context for rendergraph node construction phase. Contains all data that the node
+/// get access to and contains ready-made methods for common operations.
+#[derive(Debug)]
+pub(crate) struct NodeContext<'ctx, 'run, 'arena, B: Backend> {
+    id: NodeId,
+    seed: &'ctx mut NodeSeed,
+    run: &'ctx mut ConstructContext<'run, 'arena, B>,
+    next_image_id: usize,
+    next_buffer_id: usize,
 }
 
 pub trait NodeCtx<'run, B: Backend> {
@@ -1080,7 +1088,6 @@ impl<'n, B: Backend> RenderPassSubpass<'n, B> {
 pub(crate) struct RenderPassNode<'run, B: Backend> {
     pub(crate) subpasses: SmallVec<[RenderPassSubpass<'run, B>; 4]>,
     pub(crate) deps: SmallVec<[rendy_core::hal::pass::SubpassDependency; 32]>,
-    
 }
 impl<'run, B: Backend> RenderPassNode<'run, B> {
     pub(crate) fn new() -> Self {
@@ -1457,7 +1464,7 @@ impl<'run, 'arena, B: Backend> PlanGraph<'run, 'arena, B> {
         exec: NodeExecution<'run, B>,
     ) -> Result<(), NodeConstructionError> {
         // inserts should always happen in such order that resource usages are free to be drained
-        debug_assert!(self.resource_usage.len() == seed.resources.end);
+        assert!(self.resource_usage.len() == seed.resources.end);
 
         // insert execution node
         let (node, allow_attachments) = match exec {
@@ -1668,14 +1675,16 @@ impl<'run, 'arena, B: Backend> PlanGraph<'run, 'arena, B> {
                         .unwrap();
 
                     if let Some(last_version) = self.last_writes.get(&res_id).copied() {
-                        self.dag
-                            .insert_edge_unchecked(
-                                self.alloc,
-                                last_version,
-                                semaphore_node,
-                                PlanEdge::Origin,
-                            )
-                            .unwrap();
+                        if let Some(origin) = last_version.origin(&self.dag) {
+                            self.dag
+                                .insert_edge_unchecked(
+                                    self.alloc,
+                                    origin,
+                                    semaphore_node,
+                                    PlanEdge::Origin,
+                                )
+                                .unwrap();
+                        }
                     }
                 }
             }
@@ -1692,6 +1701,8 @@ pub struct ExecPassContext<'a, B: Backend> {
     subpass: rendy_core::hal::pass::Subpass<'a, B>,
     images: HashMap<ImageId, Handle<Image<B>>>,
     buffers: HashMap<BufferId, Handle<Buffer<B>>>,
+    subpass_id: SubpassId,
+    viewport_rect: rendy_core::hal::pso::Rect,
 }
 
 impl<'a, B: Backend> ExecPassContext<'a, B> {
@@ -1707,6 +1718,26 @@ impl<'a, B: Backend> ExecPassContext<'a, B> {
             .get(&token.id())
             .expect("Somehow got a token to unscheduled buffer")
             .clone()
+    }
+
+    pub fn subpass_id(&self) -> SubpassId {
+        self.subpass_id
+    }
+
+    pub fn subpass(&self) -> rendy_core::hal::pass::Subpass<'a, B> {
+        self.subpass
+    }
+
+    pub fn viewport_rect(&self) -> rendy_core::hal::pso::Rect {
+        self.viewport_rect
+    }
+
+    pub fn frames(&self) -> &'a Frames<B> {
+        self.frames
+    }
+
+    pub fn factory(&self) -> &'a Factory<B> {
+        self.factory
     }
 }
 
@@ -2060,7 +2091,7 @@ impl<'run, B: Backend> ExecContext<'run, B> {
 
     fn add_signal(&mut self, family_type: FamilyType, semaphore_index: usize) {
         let family_id = self.resources.family_id(family_type);
-        if let Some(submit_data) = family_id.and_then(|id| self.submit_data.get_mut(&id)) {
+        if let Some(submit_data) = family_id.map(|id| self.submit_data.entry(id).or_default()) {
             submit_data.signals.push(semaphore_index);
         } else {
             panic!(
@@ -2077,7 +2108,7 @@ impl<'run, B: Backend> ExecContext<'run, B> {
         stages: rendy_core::hal::pso::PipelineStage,
     ) {
         let family_id = self.resources.family_id(family_type);
-        if let Some(submit_data) = family_id.and_then(|id| self.submit_data.get_mut(&id)) {
+        if let Some(submit_data) = family_id.map(|id| self.submit_data.entry(id).or_default()) {
             submit_data.waits.push((semaphore_index, stages));
         } else {
             panic!(
@@ -2089,6 +2120,13 @@ impl<'run, B: Backend> ExecContext<'run, B> {
 
     pub fn queue_id(&self, family_type: FamilyType) -> QueueId {
         self.resources.queue(family_type)
+    }
+
+    pub fn command_pool(
+        &mut self,
+        family_type: FamilyType,
+    ) -> &mut CommandPool<B, QueueType, IndividualReset> {
+        self.resources.command_pool(family_type)
     }
 
     pub fn request_render_pass(&mut self, pass_info: RenderPassInfo) -> &B::RenderPass {

@@ -91,6 +91,65 @@ unsafe impl QueuesConfigure for OneGraphicsQueue {
     }
 }
 
+/// QueuePicker that picks optimal queue families for rendering graph.
+///
+/// TODO: Try to pick family that is capable of presenting
+/// This is possible in platform-dependent way for some platforms.
+///
+/// To pick multiple families with require number of queues
+/// a custom [`QueuesConfigure`] implementation can be used instead.
+///
+/// [`QueuesConfigure`]: trait.QueuesConfigure.html
+#[derive(Clone, Copy, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct GraphOptimizedQueues;
+
+unsafe impl QueuesConfigure for GraphOptimizedQueues {
+    type Priorities = [f32; 1];
+    type Families = Vec<(FamilyId, [f32; 1])>;
+    fn configure(
+        &self,
+        device: DeviceId,
+        families: &[impl rendy_core::hal::queue::QueueFamily],
+    ) -> Vec<(FamilyId, [f32; 1])> {
+        let mut found_general: Option<usize> = None;
+        let mut found_graphics: Option<usize> = None;
+        let mut found_compute: Option<usize> = None;
+        let mut found_transfer: Option<usize> = None;
+
+        macro_rules! find_family {
+            (|$ty:ident| $f:expr) => {
+                families.iter().find(|family| {
+                    let $ty = family.queue_type();
+                    let id = Some(family.id().0);
+                    
+                    id != found_general &&
+                    id != found_graphics &&
+                    id != found_compute &&
+                    id != found_transfer &&
+                    $f
+                }).map(|family| family.id().0)
+            }
+        };
+
+        found_general = find_family!(|ty| (ty.supports_graphics() && ty.supports_compute()));
+        found_compute = find_family!(|ty| (ty.supports_compute() && !ty.supports_graphics()));
+        found_graphics = if found_general.is_some() {
+            None
+        } else {
+            find_family!(|ty| ty.supports_graphics() && !ty.supports_compute())
+        };
+        found_transfer = find_family!(|ty| !ty.supports_graphics() && !ty.supports_compute());
+
+        let mut configured: Vec<(FamilyId, [f32; 1])> = Vec::new();
+        configured.extend(found_general.map(|index| (FamilyId { device, index }, [1.0])));
+        configured.extend(found_compute.map(|index| (FamilyId { device, index }, [0.8])));
+        configured.extend(found_graphics.map(|index| (FamilyId { device, index }, [1.0])));
+        configured.extend(found_transfer.map(|index| (FamilyId { device, index }, [0.5])));
+        configured
+    }
+}
+
 /// Saved config for queues.
 /// This config can be loaded from config files
 /// in any format supported by serde ecosystem.

@@ -18,12 +18,13 @@ use rendy_memory as memory;
 mod buffer;
 mod escape;
 mod image;
+mod pipeline;
 mod set;
 
 mod resources;
 mod sampler;
 
-pub use crate::{buffer::*, escape::*, image::*, resources::*, sampler::*, set::*};
+pub use crate::{buffer::*, escape::*, image::*, pipeline::*, resources::*, sampler::*, set::*};
 
 /// Error creating a resource.
 #[derive(Clone, Debug, PartialEq)]

@@ -19,6 +19,11 @@ pub struct VirtualId(pub(super) usize);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct WaitId(pub(super) usize);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RenderPassId(pub(super) usize);
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SubpassId(pub(super) RenderPassId, usize);
+
 #[derive(Debug, Clone, Copy)]
 pub enum ImageLoad {
     /// Image contents left undefined. The fastest option when you expect to overwrite it all anyway.

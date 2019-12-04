@@ -48,40 +48,40 @@ impl<B: Backend> Pipeline<B> {
     }
     #[inline(never)]
     pub(crate) fn reduce<'a>(&mut self, graph: &mut PlanDag<'_, 'a, B>, alloc: &'a GraphAllocator) {
-        let start = std::time::Instant::now();
-        // let mut file = std::fs::File::create("graph.dot").unwrap();
+        let _start = std::time::Instant::now();
 
         graph.trim(NodeIndex::new(0)).unwrap();
-        let trim1 = std::time::Instant::now();
-        // crate::new::test::visualize_graph(&mut file, graph, "trim");
+        let _trim1 = std::time::Instant::now();
 
         let ctx = ReductionContext::new(Contributions::collect(graph, alloc));
-        let collect = std::time::Instant::now();
+        let _collect = std::time::Instant::now();
 
         self.stage1.reduce_graph(graph, &ctx, alloc);
-        let stage1 = std::time::Instant::now();
-        // crate::new::test::visualize_graph(&mut file, graph, "stage1");
+        let _stage1 = std::time::Instant::now();
 
         self.stage2.reduce_graph(graph, &ctx, alloc);
-        let stage2 = std::time::Instant::now();
-        // crate::new::test::visualize_graph(&mut file, graph, "stage2");
+        let _stage2 = std::time::Instant::now();
 
         graph.trim(NodeIndex::new(0)).unwrap();
-        let trim2 = std::time::Instant::now();
+        let _trim2 = std::time::Instant::now();
 
         self.stage3.reduce_graph(graph, &ctx, alloc);
-        let stage3 = std::time::Instant::now();
+        let _stage3 = std::time::Instant::now();
 
-        eprintln!(
-            "Reduce timings:\n\ttrim1:  {}μs\n\tcollect:{}μs\n\tstage1: {}μs\n\tstage2: {}μs\n\ttrim2:  {}μs\n\tstage3: {}μs\n\ttotal:  {}μs",
-            (trim1 - start).as_micros(),
-            (collect - trim1).as_micros(),
-            (stage1 - collect).as_micros(),
-            (stage2 - stage1).as_micros(),
-            (trim2 - stage2).as_micros(),
-            (stage3 - trim2).as_micros(),
-            (stage3 - start).as_micros()
-        );
+        let mut file = std::fs::File::create("graph.dot").unwrap();
+        println!("Vis!");
+        crate::new::test::visualize_graph(&mut file, graph, "real");
+
+        // eprintln!(
+        //     "Reduce timings:\n\ttrim1:  {}μs\n\tcollect:{}μs\n\tstage1: {}μs\n\tstage2: {}μs\n\ttrim2:  {}μs\n\tstage3: {}μs\n\ttotal:  {}μs",
+        //     (_trim1 - _start).as_micros(),
+        //     (_collect - _trim1).as_micros(),
+        //     (_stage1 - _collect).as_micros(),
+        //     (_stage2 - _stage1).as_micros(),
+        //     (_trim2 - _stage2).as_micros(),
+        //     (_stage3 - _trim2).as_micros(),
+        //     (_stage3 - _start).as_micros()
+        // );
     }
 }
 

@@ -48,7 +48,7 @@ impl<F> std::fmt::Debug for Present<F> {
 }
 
 impl<F> Present<F> {
-    fn new(get_target: F, clear: Option<hal::command::ClearColor>) -> Self {
+    pub fn new(get_target: F, clear: Option<hal::command::ClearColor>) -> Self {
         Self { get_target, clear }
     }
 }
@@ -161,9 +161,7 @@ where
             }
             Err(err) => {
                 log::debug!("Swapchain acquisition error: {:#?}", err);
-                unsafe {
-                    ctx.recycle_semaphores(Some(semaphore));
-                }
+                ctx.recycle_semaphores(Some(semaphore));
                 // just create a dummy image and do nothing
                 let image_info = ImageInfo {
                     kind: hal::image::Kind::D2(extent.width, extent.height, 1, 1),

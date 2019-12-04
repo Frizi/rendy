@@ -43,6 +43,7 @@ fixedbitset = "0.2"
 graphy = { git = "https://github.com/jaynus/graphy/", branch = "master" }
 # purple = { path="../../purple" }
 purple = { git = "https://github.com/jaynus/purple.git", branch = "master" }
+dot = "0.1"
 
 [dev-dependencies]
 env_logger = "0.6"

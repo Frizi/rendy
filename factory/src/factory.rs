@@ -17,11 +17,14 @@ use {
             adapter::{Adapter, Gpu, PhysicalDevice},
             buffer,
             device::{
-                AllocationError, CreationError, Device as _, MapError, OomOrDeviceLost,
-                OutOfMemory, WaitFor,
+                AllocationError, CreationError as DeviceCreationError, Device as _, MapError,
+                OomOrDeviceLost, OutOfMemory, WaitFor,
             },
             format, image,
-            pso::DescriptorSetLayoutBinding,
+            pso::{
+                ComputePipelineDesc, CreationError as PipelineCreationError,
+                DescriptorSetLayoutBinding, GraphicsPipelineDesc,
+            },
             window::{Extent2D, InitError, Surface as GfxSurface},
             Backend, Features, Instance as _, Limits,
         },
@@ -40,6 +43,8 @@ struct ResourceHub<B: Backend> {
     layouts: ResourceTracker<DescriptorSetLayout<B>>,
     sets: ResourceTracker<DescriptorSet<B>>,
     samplers: ResourceTracker<Sampler<B>>,
+    graphics_pipelines: ResourceTracker<GraphicsPipeline<B>>,
+    compute_pipelines: ResourceTracker<ComputePipeline<B>>,
     samplers_cache: parking_lot::RwLock<SamplerCache<B>>,
 }
 
@@ -55,6 +60,8 @@ where
             layouts: ResourceTracker::default(),
             sets: ResourceTracker::default(),
             samplers: ResourceTracker::default(),
+            graphics_pipelines: ResourceTracker::default(),
+            compute_pipelines: ResourceTracker::default(),
             samplers_cache: parking_lot::RwLock::new(SamplerCache::default()),
         }
     }
@@ -83,6 +90,10 @@ where
             .cleanup(|i| i.dispose(device, heaps), &next, &complete);
         self.samplers
             .cleanup(|i| i.dispose(device), &next, &complete);
+        self.graphics_pipelines
+            .cleanup(|i| i.dispose(device), &next, &complete);
+        self.compute_pipelines
+            .cleanup(|i| i.dispose(device), &next, &complete);
     }
 
     unsafe fn dispose(
@@ -98,6 +109,8 @@ where
         self.buffers.dispose(|b| b.dispose(device, heaps));
         self.images.dispose(|i| i.dispose(device, heaps));
         self.samplers.dispose(|i| i.dispose(device));
+        self.graphics_pipelines.dispose(|i| i.dispose(device));
+        self.compute_pipelines.dispose(|i| i.dispose(device));
     }
 }
 
@@ -412,7 +425,7 @@ where
     ///
     /// # Safety
     ///
-    /// Sampler view must not be used by any pending commands or referenced anywhere.
+    /// Sampler must not be used by any pending commands or referenced anywhere.
     ///
     /// [`create_sampler`]: #method.create_sampler
     /// [`get_sampler`]: #method.get_sampler
@@ -446,6 +459,90 @@ where
             info.clone(),
             || Ok(samplers.handle(Sampler::create(device, info)?)),
         )
+    }
+
+    /// Create an graphics pipeline
+    ///
+    /// This function returns relevant value, that is, the value cannot be dropped.
+    /// However graphics pipeline can be destroyed using [`destroy_relevant_graphics_pipeline`] function.
+    ///
+    /// [`destroy_relevant_graphics_pipeline`]: #method.destroy_relevant_graphics_pipeline
+    pub fn create_relevant_graphics_pipeline(
+        &self,
+        desc: &GraphicsPipelineDesc<B>,
+    ) -> Result<GraphicsPipeline<B>, PipelineCreationError> {
+        // TODO: use pipeline cache
+        GraphicsPipeline::create(&self.device, desc, None)
+    }
+
+    /// Destroy graphics pipeline.
+    /// If graphics_pipeline was created using [`create_graphics_pipeline`] it must be unescaped first.
+    /// If graphics_pipeline was shaderd unescaping may fail due to other owners existing.
+    /// In any case unescaping and destroying manually can slightly increase performance.
+    ///
+    /// # Safety
+    ///
+    /// Graphics pipeline must not be used by any pending commands or referenced anywhere.
+    ///
+    /// [`create_sampler`]: #method.create_sampler
+    /// [`get_sampler`]: #method.get_sampler
+    pub unsafe fn destroy_relevant_graphics_pipeline(&self, pipeline: GraphicsPipeline<B>) {
+        pipeline.dispose(&self.device);
+    }
+
+    /// Creates a graphics pipeline.
+    ///
+    /// This function (unlike [`create_relevant_graphics_pipeline`]) returns value that can be dropped.
+    ///
+    /// [`create_relevant_sampler`]: #method.create_relevant_sampler
+    pub fn create_graphics_pipeline(
+        &self,
+        info: &GraphicsPipelineDesc<B>,
+    ) -> Result<Escape<GraphicsPipeline<B>>, PipelineCreationError> {
+        let pipeline = self.create_relevant_graphics_pipeline(info)?;
+        Ok(self.resources.graphics_pipelines.escape(pipeline))
+    }
+
+    /// Create an compute pipeline
+    ///
+    /// This function returns relevant value, that is, the value cannot be dropped.
+    /// However compute pipeline can be destroyed using [`destroy_relevant_compute_pipeline`] function.
+    ///
+    /// [`destroy_relevant_compute_pipeline`]: #method.destroy_relevant_compute_pipeline
+    pub fn create_relevant_compute_pipeline(
+        &self,
+        desc: &ComputePipelineDesc<B>,
+    ) -> Result<ComputePipeline<B>, PipelineCreationError> {
+        // TODO: use pipeline cache
+        ComputePipeline::create(&self.device, desc, None)
+    }
+
+    /// Destroy compute pipeline.
+    /// If compute_pipeline was created using [`create_compute_pipeline`] it must be unescaped first.
+    /// If compute_pipeline was shaderd unescaping may fail due to other owners existing.
+    /// In any case unescaping and destroying manually can slightly increase performance.
+    ///
+    /// # Safety
+    ///
+    /// compute pipeline must not be used by any pending commands or referenced anywhere.
+    ///
+    /// [`create_sampler`]: #method.create_sampler
+    /// [`get_sampler`]: #method.get_sampler
+    pub unsafe fn destroy_relevant_compute_pipeline(&self, pipeline: ComputePipeline<B>) {
+        pipeline.dispose(&self.device);
+    }
+
+    /// Creates a compute pipeline.
+    ///
+    /// This function (unlike [`create_relevant_compute_pipeline`]) returns value that can be dropped.
+    ///
+    /// [`create_relevant_sampler`]: #method.create_relevant_sampler
+    pub fn create_compute_pipeline(
+        &self,
+        info: &ComputePipelineDesc<B>,
+    ) -> Result<Escape<ComputePipeline<B>>, PipelineCreationError> {
+        let pipeline = self.create_relevant_compute_pipeline(info)?;
+        Ok(self.resources.compute_pipelines.escape(pipeline))
     }
 
     /// Update content of the buffer bound to host visible memory.
@@ -1180,7 +1277,7 @@ where
 pub fn init_with_instance<B>(
     instance: Instance<B>,
     config: &Config<impl DevicesConfigure, impl HeapsConfigure, impl QueuesConfigure>,
-) -> Result<(Factory<B>, Families<B>), CreationError>
+) -> Result<(Factory<B>, Families<B>), DeviceCreationError>
 where
     B: Backend,
 {
@@ -1194,7 +1291,7 @@ where
 pub fn init_with_instance_ref<B>(
     instance: &Instance<B>,
     config: &Config<impl DevicesConfigure, impl HeapsConfigure, impl QueuesConfigure>,
-) -> Result<(Factory<B>, Families<B>), CreationError>
+) -> Result<(Factory<B>, Families<B>), DeviceCreationError>
 where
     B: Backend,
 {
@@ -1205,7 +1302,7 @@ where
 
     if adapters.is_empty() {
         log::warn!("No physical devices found");
-        return Err(rendy_core::hal::device::CreationError::InitializationFailed);
+        return Err(DeviceCreationError::InitializationFailed);
     }
 
     log::debug!(

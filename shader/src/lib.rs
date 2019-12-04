@@ -26,6 +26,7 @@ pub use self::reflect::{ReflectError, ReflectTypeError, RetrievalKind, SpirvRefl
 
 use rendy_core::hal::{pso::ShaderStageFlags, Backend};
 use std::collections::HashMap;
+use relevant::Relevant;
 
 /// Error type returned by this module.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -207,8 +208,8 @@ impl<B: Backend> ShaderSet<B> {
     }
 
     /// Must be called to perform a drop of the Backend ShaderModule object otherwise the shader will never be destroyed in memory.
-    pub fn dispose(&mut self, factory: &rendy_factory::Factory<B>) {
-        for (_, shader) in self.shaders.iter_mut() {
+    pub fn dispose(self, factory: &rendy_factory::Factory<B>) {
+        for (_, shader) in self.shaders.into_iter() {
             shader.dispose(factory);
         }
     }
@@ -281,6 +282,7 @@ impl ShaderSetBuilder {
                     module: None,
                     entrypoint: shader.1.clone(),
                     specialization: shader.2,
+                    relevant: Relevant,
                 };
                 unsafe {
                     storage.compile(factory)?;
@@ -447,6 +449,7 @@ pub struct ShaderStorage<B: Backend> {
     module: Option<B::ShaderModule>,
     entrypoint: String,
     specialization: Option<rendy_core::hal::pso::Specialization<'static>>,
+    relevant: Relevant,
 }
 impl<B: Backend> ShaderStorage<B> {
     /// Builds the `EntryPoint` structure used by rendy_core::hal to determine how to utilize this shader
@@ -476,20 +479,13 @@ impl<B: Backend> ShaderStorage<B> {
         Ok(())
     }
 
-    fn dispose(&mut self, factory: &rendy_factory::Factory<B>) {
+    fn dispose(mut self, factory: &rendy_factory::Factory<B>) {
         use rendy_core::hal::device::Device;
 
         if let Some(module) = self.module.take() {
             unsafe { factory.destroy_shader_module(module) };
         }
         self.module = None;
-    }
-}
-
-impl<B: Backend> Drop for ShaderStorage<B> {
-    fn drop(&mut self) {
-        if self.module.is_some() {
-            panic!("This shader storage class needs to be manually dropped with dispose() first");
-        }
+        self.relevant.dispose();
     }
 }

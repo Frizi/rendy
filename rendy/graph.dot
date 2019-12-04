@@ -1,0 +1,33 @@
+digraph real {
+    N0[label=<<font color="#99aaff"><font color="white">real</font></font>>][style="filled"][color="#99aaff"][shape="circle"];
+    N1[label=<<font color="#0000ff"><table border='0' cellborder='1' cellspacing='0'><tr><td><b>1: Image N0[0]</b></td></tr><tr><td>D2(1440, 960, 1, 1)</td></tr><tr><td>Bgra8Srgb, levels: 1</td></tr></table></font>>][style="bold"][color="#0000ff"][shape="plain"];
+    N2[label=<<font color="#2266ff">2: UndefinedImage</font>>][style="bold"][color="#2266ff"][shape="box"];
+    N3[label=<<font color="#03c03c">3: RenderPass[1]</font>>][style="bold"][color="#03c03c"][shape="box"];
+    N4[label=<<font color="#2266ff">4: ImageVersion</font>>][style="bold"][color="#2266ff"][shape="box"];
+    N5[label=<<font color="#9b03c0">5: PostSubmit</font>>][style="bold"][color="#9b03c0"][shape="box"];
+    N6[label=<<font color="#ff3355">6: Semaphore(WaitId(0))</font>>][style="bold"][color="#ff3355"][shape="box"];
+    E0[label=<<font color="#ff950f">Origin</font>>][style="rounded"][color="#ff950f"][shape="plain"];
+    E1[label=<<font color="#44aa99">ColorAttachmentOptimal</font>>][style="rounded"][color="#44aa99"][shape="plain"];
+    E2[label=<<font color="#ff950f">Origin</font>>][style="rounded"][color="#ff950f"][shape="plain"];
+    E3[label=<<font color="#ff250f">Version</font>>][style="rounded"][color="#ff250f"][shape="plain"];
+    E4[label=<<font color="#d119bf">Effect</font>>][style="rounded"][color="#d119bf"][shape="plain"];
+    E5[label=<<font color="#aaaaff"><table border='0' cellborder='1' cellspacing='0'><tr><td><b>ImageAccess</b></td></tr><tr><td>PRESENT</td></tr><tr><td>BOTTOM_OF_PIPE</td></tr></table></font>>][style="rounded"][color="#aaaaff"][shape="plain"];
+    E6[label=<<font color="#ff77cc">Wait(BOTTOM_OF_PIPE)</font>>][style="rounded"][color="#ff77cc"][shape="plain"];
+    E7[label=<<font color="#ff950f">Origin</font>>][style="rounded"][color="#ff950f"][shape="plain"];
+    N1 -> E0[label=""][style="filled"][color="#ff950f"][arrowhead="none"];
+    E0 -> N2[label=""][style="filled"][color="#ff950f"][arrowhead="normal"];
+    N2 -> E1[label=""][style="filled"][color="#44aa99"][arrowhead="none"];
+    E1 -> N3[label=""][style="filled"][color="#44aa99"][arrowhead="normal"];
+    N3 -> E2[label=""][style="filled"][color="#ff950f"][arrowhead="none"];
+    E2 -> N4[label=""][style="filled"][color="#ff950f"][arrowhead="normal"];
+    N2 -> E3[label=""][style="dashed"][color="#ff250f"][arrowhead="none"];
+    E3 -> N4[label=""][style="dashed"][color="#ff250f"][arrowhead="normal"];
+    N5 -> E4[label=""][style="dashed"][color="#d119bf"][arrowhead="none"];
+    E4 -> N0[label=""][style="dashed"][color="#d119bf"][arrowhead="normal"];
+    N4 -> E5[label=""][style="filled"][color="#aaaaff"][arrowhead="none"];
+    E5 -> N5[label=""][style="filled"][color="#aaaaff"][arrowhead="normal"];
+    N6 -> E6[label=""][style="filled"][color="#ff77cc"][arrowhead="none"];
+    E6 -> N5[label=""][style="filled"][color="#ff77cc"][arrowhead="normal"];
+    N3 -> E7[label=""][style="filled"][color="#ff950f"][arrowhead="none"];
+    E7 -> N6[label=""][style="filled"][color="#ff950f"][arrowhead="normal"];
+}

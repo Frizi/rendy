@@ -172,6 +172,10 @@ where
                 family_ops.push(None);
             }
 
+            if !family.capability().supports_graphics() {
+                continue;
+            }
+
             family_ops[family.id().index] = Some(parking_lot::Mutex::new(FamilyGraphicsOps {
                 pool: family
                     .create_pool(device)
@@ -275,10 +279,9 @@ where
     ///
     pub(crate) unsafe fn flush(&mut self, families: &mut Families<B>) {
         for family in families.as_slice_mut() {
-            let blitter = self.family_ops[family.id().index]
-                .as_mut()
-                .expect("Blitter must be initialized for all families");
-            blitter.get_mut().flush(family);
+            if let Some(blitter) = self.family_ops[family.id().index].as_mut() {
+                blitter.get_mut().flush(family);
+            }
         }
     }
 
