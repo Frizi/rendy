@@ -17,7 +17,7 @@ use {
             resources::{
                 AttachmentAccess, BufferId, BufferInfo, BufferUsage, ImageId, ImageInfo, ImageLoad,
                 ImageUsage, NodeBufferAccess, NodeImageAccess, NodeVirtualAccess, ResourceId,
-                ResourceUsage, SubpassId, VirtualId, WaitId, WaitableResource,
+                ResourceUsage, SubpassId, RenderPassId, VirtualId, WaitId, WaitableResource,
             },
             walker::Topo,
         },
@@ -1097,31 +1097,49 @@ impl<'run, B: Backend> RenderPassNode<'run, B> {
         }
     }
 
-    fn run(self, ctx: &mut ExecContext<'run, B>) {
+    fn run(self, ctx: &mut ExecContext<'run, B>) -> Result<(), GraphRunError> {
         assert!(self.subpasses.len() > 0);
 
-        // let pass_info = unimplemented!();
-        // let render_pass = general_ctx.request_render_pass(&self);
+        let pass_info = unimplemented!();
+        let render_pass = ctx.request_render_pass(&self);
 
-        // let queue: &mut Queue<B> = general_ctx.queue_mut(FamilyType::Graphics);
+        // let queue: &mut Queue<B> = ctx.queue_mut(FamilyType::Graphics);
 
-        // for (index, subpass) in self.subpasses.iter().enumerate() {
-        //     let subpass = rendy_core::hal::pass::Subpass {
-        //         index,
-        //         main_pass: render_pass,
-        //     };
+        // TODO: get rect from render pass
+        let framebuffer_width = 1024;
+        let framebuffer_height = 768;
+        let viewport_rect = rendy_core::hal::pso::Rect {
+            x: 0,
+            y: 0,
+            w: framebuffer_width as i16,
+            h: framebuffer_height as i16,
+        };
 
-        //     let pass_ctx = ExecPassContext {
-        //         factory: general_ctx.factory(),
-        //         queue,
-        //         frames: general_ctx.frames(),
-        //         // encoder: &'a mut RenderPassEncoder<'a, B>,
-        //         subpass,
-        //         images: HashMap::new(),
-        //         buffers: HashMap::new(),
-        //     };
-        //     subpass(pass_ctx);
-        // }
+        let mut submits = Vec::with_capacity(self.subpasses.len());
+
+        for (index, (node_id, subpass_fn)) in self.subpasses.iter().enumerate() {
+            let subpass = rendy_core::hal::pass::Subpass {
+                index,
+                main_pass: render_pass,
+            };
+
+            // TODO:
+            let subpass_id = SubpassId(RenderPassId(0), index);
+
+            let submit = subpass_fn(ExecPassContext {
+                factory: ctx.factory(),
+                frames: ctx.frames(),
+                subpass,
+                subpass_id,
+                images: HashMap::new(),
+                buffers: HashMap::new(),
+                viewport_rect,
+            }).map_err(|e| GraphRunError::NodeExecution(node_id, e))?;
+
+            submits.push(submit);
+        }
+
+        Ok(())
     }
 }
 
@@ -1695,9 +1713,7 @@ impl<'run, 'arena, B: Backend> PlanGraph<'run, 'arena, B> {
 #[derive(Debug)]
 pub struct ExecPassContext<'a, B: Backend> {
     factory: &'a Factory<B>,
-    queue: &'a mut Queue<B>,
     frames: &'a Frames<B>,
-    encoder: &'a mut RenderPassEncoder<'a, B>,
     subpass: rendy_core::hal::pass::Subpass<'a, B>,
     images: HashMap<ImageId, Handle<Image<B>>>,
     buffers: HashMap<BufferId, Handle<Buffer<B>>>,
@@ -1960,7 +1976,7 @@ impl<'run, B: Backend> ExecContext<'run, B> {
 
                 match std::mem::replace(&mut graph.dag[node], PlanNode::Evaluated) {
                     PlanNode::RenderPass(pass) => {
-                        pass.run(&mut self);
+                        pass.run(&mut self)?
                     }
                     PlanNode::Submission(node_id, closure) => {
                         closure(&mut self).map_err(|e| GraphRunError::NodeExecution(node_id, e))?

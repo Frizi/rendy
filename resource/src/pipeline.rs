@@ -56,7 +56,7 @@ impl<B: Backend> GraphicsPipeline<B> {
     pub fn raw(&self) -> &B::GraphicsPipeline {
         &self.raw
     }
-    
+
     /// Dispose of a graphics pipeline.
     /// Safety:
     /// - graphics pipeline must not be used in any unfinished submit.

@@ -8,7 +8,10 @@ use rendy::{
         CommandPool, Families, Family, Graphics, IndividualReset, QueueId, QueueType,
         RenderPassContinue, RenderPassEncoder, SecondaryLevel, SimultaneousUse, Submit,
     },
-    factory::{Config, Factory, ImageState,BasicHeapsConfigure, BasicDevicesConfigure, GraphOptimizedQueues},
+    factory::{
+        BasicDevicesConfigure, BasicHeapsConfigure, Config, Factory, GraphOptimizedQueues,
+        ImageState,
+    },
     frame::cirque::CommandCirqueOverlap,
     graph::{
         new::{
@@ -384,10 +387,8 @@ impl<B: Backend, T: ?Sized> Node<B, T> for SpriteGraphicsPipelineImpl<B> {
 
                     (pso, submit)
                 });
-                // TODO: actually submit
-                // Ok(submit)
-                let _ = submit;
-                Ok(())
+
+                Ok(submit.into())
             }),
         ))
     }
@@ -470,7 +471,8 @@ fn main() {
         .filter_module("sprite", log::LevelFilter::Trace)
         .init();
 
-    let config: Config<BasicDevicesConfigure, BasicHeapsConfigure, GraphOptimizedQueues> = Default::default();
+    let config: Config<BasicDevicesConfigure, BasicHeapsConfigure, GraphOptimizedQueues> =
+        Default::default();
 
     let event_loop = EventLoop::new();
     let window = WindowBuilder::new()
@@ -482,6 +484,21 @@ fn main() {
         (mut factory, mut families, surface, window) => {
             let size = window.inner_size().to_physical(window.hidpi_factor());
 
+            let caps = factory.get_surface_capabilities(&surface);
+            let image_count = 2
+                .min(*caps.image_count.end())
+                .max(*caps.image_count.start());
+
+            use hal::window::PresentMode;
+
+            let present_mode = match () {
+                _ if caps.present_modes.contains(PresentMode::IMMEDIATE) => PresentMode::IMMEDIATE,
+                _ if caps.present_modes.contains(PresentMode::RELAXED) => PresentMode::RELAXED,
+                _ if caps.present_modes.contains(PresentMode::MAILBOX) => PresentMode::MAILBOX,
+                _ if caps.present_modes.contains(PresentMode::FIFO) => PresentMode::FIFO,
+                _ => panic!("No known present modes found"),
+            };
+
             let mut graph_builder = GraphBuilder::<_, ()>::new();
 
             let target = factory
@@ -491,8 +508,8 @@ fn main() {
                     width: size.width as _,
                     height: size.height as _,
                 },
-                2,
-                rendy_core::hal::window::PresentMode::RELAXED,
+                image_count,
+                present_mode,
                 rendy_core::hal::image::Usage::COLOR_ATTACHMENT,
             ).unwrap();
 

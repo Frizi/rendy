@@ -22,7 +22,7 @@ pub struct WaitId(pub(super) usize);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RenderPassId(pub(super) usize);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SubpassId(pub(super) RenderPassId, usize);
+pub struct SubpassId(pub(super) RenderPassId, pub(super) usize);
 
 #[derive(Debug, Clone, Copy)]
 pub enum ImageLoad {

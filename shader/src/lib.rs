@@ -24,9 +24,9 @@ pub use self::shaderc::*;
 #[cfg(feature = "spirv-reflection")]
 pub use self::reflect::{ReflectError, ReflectTypeError, RetrievalKind, SpirvReflection};
 
+use relevant::Relevant;
 use rendy_core::hal::{pso::ShaderStageFlags, Backend};
 use std::collections::HashMap;
-use relevant::Relevant;
 
 /// Error type returned by this module.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

@@ -119,17 +119,20 @@ unsafe impl QueuesConfigure for GraphOptimizedQueues {
 
         macro_rules! find_family {
             (|$ty:ident| $f:expr) => {
-                families.iter().find(|family| {
-                    let $ty = family.queue_type();
-                    let id = Some(family.id().0);
-                    
-                    id != found_general &&
-                    id != found_graphics &&
-                    id != found_compute &&
-                    id != found_transfer &&
-                    $f
-                }).map(|family| family.id().0)
-            }
+                families
+                    .iter()
+                    .find(|family| {
+                        let $ty = family.queue_type();
+                        let id = Some(family.id().0);
+
+                        id != found_general
+                            && id != found_graphics
+                            && id != found_compute
+                            && id != found_transfer
+                            && $f
+                    })
+                    .map(|family| family.id().0)
+            };
         };
 
         found_general = find_family!(|ty| (ty.supports_graphics() && ty.supports_compute()));

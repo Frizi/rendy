@@ -22,7 +22,6 @@ pub struct FamilyId {
     pub device: DeviceId,
     /// Family id within device.
     pub index: usize,
-
 }
 
 impl From<FamilyId> for rendy_core::hal::queue::QueueFamilyId {

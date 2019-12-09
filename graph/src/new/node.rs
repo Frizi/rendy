@@ -4,7 +4,10 @@ use {
         resources::{BufferId, ImageId, ResourceUsage},
     },
     crate::{
-        command::{Capability, Families, Family, FamilyId},
+        command::{
+            Capability, EitherSubmit, Families, Family, FamilyId, RenderPassContinue,
+            SecondaryLevel,
+        },
         factory::{Factory, UploadError},
         wsi::SwapchainError,
     },
@@ -359,10 +362,15 @@ impl<B: Backend, T: ?Sized, N: NodeBuilder<B, T>> DynNodeBuilder<B, T> for N {
     }
 }
 
-pub type ExecResult = Result<(), NodeExecutionError>;
-pub type PassFn<'run, B> = Box<dyn for<'a> FnOnce(ExecPassContext<'a, B>) -> ExecResult + 'run>;
-pub type SubmissionFn<'run, B> = Box<dyn FnOnce(&mut ExecContext<'run, B>) -> ExecResult + 'run>;
-pub type PostSubmitFn<'run, B> = Box<dyn FnOnce(&mut ExecContext<'run, B>) -> ExecResult + 'run>;
+pub type PassSubmit<'a, B> = EitherSubmit<'a, B, SecondaryLevel, RenderPassContinue>;
+
+pub type ExecResult<T> = Result<T, NodeExecutionError>;
+pub type PassFn<'run, B> =
+    Box<dyn for<'a> FnOnce(ExecPassContext<'a, B>) -> ExecResult<PassSubmit<'run, B>> + 'run>;
+pub type SubmissionFn<'run, B> =
+    Box<dyn FnOnce(&mut ExecContext<'run, B>) -> ExecResult<()> + 'run>;
+pub type PostSubmitFn<'run, B> =
+    Box<dyn FnOnce(&mut ExecContext<'run, B>) -> ExecResult<()> + 'run>;
 
 #[derive(Debug, Clone, Copy)]
 pub enum ExecutionPhase {
@@ -410,35 +418,35 @@ impl<'run, B: Backend> NodeExecution<'run, B> {
 
     pub fn pass<F>(pass_closure: F) -> Self
     where
-        F: for<'a> FnOnce(ExecPassContext<'a, B>) -> ExecResult + 'run,
+        F: for<'a> FnOnce(ExecPassContext<'a, B>) -> ExecResult<PassSubmit<'run, B>> + 'run,
     {
         Self::RenderPass(Box::new(pass_closure))
     }
 
     pub fn submission<F>(general_closure: F) -> Self
     where
-        F: FnOnce(&mut ExecContext<'run, B>) -> ExecResult + 'run,
+        F: FnOnce(&mut ExecContext<'run, B>) -> ExecResult<()> + 'run,
     {
         Self::Submission(ExecutionPhase::Default, Box::new(general_closure))
     }
 
     pub fn output_submission<F>(general_closure: F) -> Self
     where
-        F: FnOnce(&mut ExecContext<'run, B>) -> ExecResult + 'run,
+        F: FnOnce(&mut ExecContext<'run, B>) -> ExecResult<()> + 'run,
     {
         Self::Submission(ExecutionPhase::Output, Box::new(general_closure))
     }
 
     pub fn post_submit<F>(general_closure: F) -> Self
     where
-        F: FnOnce(&mut ExecContext<'run, B>) -> ExecResult + 'run,
+        F: FnOnce(&mut ExecContext<'run, B>) -> ExecResult<()> + 'run,
     {
         Self::PostSubmit(ExecutionPhase::Default, Box::new(general_closure))
     }
 
     pub fn output_post_submit<F>(general_closure: F) -> Self
     where
-        F: FnOnce(&mut ExecContext<'run, B>) -> ExecResult + 'run,
+        F: FnOnce(&mut ExecContext<'run, B>) -> ExecResult<()> + 'run,
     {
         Self::PostSubmit(ExecutionPhase::Output, Box::new(general_closure))
     }

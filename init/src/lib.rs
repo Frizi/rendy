@@ -110,7 +110,6 @@ impl<B: Backend> Rendy<B> {
 /// Error type that may be returned by `AnyRendy::init_auto`
 pub struct RendyAutoInitError {
     pub errors: Vec<(EnabledBackend, RendyInitError)>,
-
 }
 impl std::fmt::Debug for RendyAutoInitError {
     fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
